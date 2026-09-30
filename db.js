@@ -21,6 +21,8 @@ const SQLITE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS tracks (
   id TEXT PRIMARY KEY,
   subject TEXT NOT NULL DEFAULT '',
+  recipient TEXT NOT NULL DEFAULT '',
+  sender TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS opens (
@@ -40,6 +42,8 @@ const PG_SCHEMA = `
 CREATE TABLE IF NOT EXISTS tracks (
   id TEXT PRIMARY KEY,
   subject TEXT NOT NULL DEFAULT '',
+  recipient TEXT NOT NULL DEFAULT '',
+  sender TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS opens (
@@ -64,12 +68,19 @@ async function init() {
       max: 5,
     });
     await pgPool.query(PG_SCHEMA);
+    // Migrate older DBs that were created before recipient/sender existed.
+    await pgPool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS recipient TEXT NOT NULL DEFAULT ''`);
+    await pgPool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS sender TEXT NOT NULL DEFAULT ''`);
     console.log('[db] using Postgres');
   } else {
     const { DatabaseSync } = require('node:sqlite');
     const file = process.env.SQLITE_FILE || path.join(__dirname, 'tracker.db');
     sqliteDb = new DatabaseSync(file);
     sqliteDb.exec(SQLITE_SCHEMA);
+    // Migrate older DBs (SQLite has no ADD COLUMN IF NOT EXISTS — check first).
+    const cols = sqliteDb.prepare('PRAGMA table_info(tracks)').all().map((c) => c.name);
+    if (!cols.includes('recipient')) sqliteDb.exec(`ALTER TABLE tracks ADD COLUMN recipient TEXT NOT NULL DEFAULT ''`);
+    if (!cols.includes('sender')) sqliteDb.exec(`ALTER TABLE tracks ADD COLUMN sender TEXT NOT NULL DEFAULT ''`);
     console.log('[db] using SQLite file:', file);
   }
 }
@@ -78,15 +89,34 @@ function newId() {
   return 'trk_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
-async function createTrack(subject) {
+async function createTrack(subject, recipient, sender) {
   const id = newId();
   const createdAt = new Date().toISOString();
+  const r = (recipient || '').slice(0, 300);
+  const s = (sender || '').slice(0, 200);
   if (usePostgres) {
-    await pgPool.query('INSERT INTO tracks (id, subject, created_at) VALUES ($1, $2, $3)', [id, subject || '', createdAt]);
+    await pgPool.query('INSERT INTO tracks (id, subject, recipient, sender, created_at) VALUES ($1, $2, $3, $4, $5)', [id, subject || '', r, s, createdAt]);
   } else {
-    sqliteDb.prepare('INSERT INTO tracks (id, subject, created_at) VALUES (?, ?, ?)').run(id, subject || '', createdAt);
+    sqliteDb.prepare('INSERT INTO tracks (id, subject, recipient, sender, created_at) VALUES (?, ?, ?, ?, ?)').run(id, subject || '', r, s, createdAt);
   }
   return id;
+}
+
+// Update subject/recipient/sender after compose (values are final only at send time).
+async function updateTrack(id, { subject, recipient, sender }) {
+  const sets = [];
+  const vals = [];
+  if (typeof subject === 'string') { sets.push(`subject = ${usePostgres ? '$' + (vals.length + 1) : '?'}`); vals.push(subject.slice(0, 300)); }
+  if (typeof recipient === 'string') { sets.push(`recipient = ${usePostgres ? '$' + (vals.length + 1) : '?'}`); vals.push(recipient.slice(0, 300)); }
+  if (typeof sender === 'string') { sets.push(`sender = ${usePostgres ? '$' + (vals.length + 1) : '?'}`); vals.push(sender.slice(0, 200)); }
+  if (sets.length === 0) return false;
+  if (usePostgres) {
+    vals.push(id);
+    const r = await pgPool.query(`UPDATE tracks SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+    return r.rowCount > 0;
+  }
+  const r = sqliteDb.prepare(`UPDATE tracks SET ${sets.join(', ')} WHERE id = ?`).run(...vals, id);
+  return r.changes > 0;
 }
 
 async function logOpen(trackId, { ip, userAgent, device, isGmailProxy }) {
@@ -123,7 +153,7 @@ function normRow(r) {
 async function getTrack(trackId) {
   let track;
   if (usePostgres) {
-    const r = await pgPool.query('SELECT id, subject, created_at FROM tracks WHERE id = $1', [trackId]);
+    const r = await pgPool.query('SELECT id, subject, recipient, sender, created_at FROM tracks WHERE id = $1', [trackId]);
     if (r.rowCount === 0) return null;
     track = r.rows[0];
     track.created_at = track.created_at.toISOString();
@@ -131,21 +161,21 @@ async function getTrack(trackId) {
       'SELECT id, track_id, opened_at, ip, user_agent, device, is_gmail_proxy FROM opens WHERE track_id = $1 ORDER BY opened_at ASC',
       [trackId]
     );
-    return { id: track.id, subject: track.subject, created_at: track.created_at, opens: o.rows.map(normRow) };
+    return { id: track.id, subject: track.subject, recipient: track.recipient || '', sender: track.sender || '', created_at: track.created_at, opens: o.rows.map(normRow) };
   }
-  const t = sqliteDb.prepare('SELECT id, subject, created_at FROM tracks WHERE id = ?').get(trackId);
+  const t = sqliteDb.prepare('SELECT id, subject, recipient, sender, created_at FROM tracks WHERE id = ?').get(trackId);
   if (!t) return null;
   const opens = sqliteDb
     .prepare('SELECT id, track_id, opened_at, ip, user_agent, device, is_gmail_proxy FROM opens WHERE track_id = ? ORDER BY opened_at ASC')
     .all(trackId)
     .map(normRow);
-  return { id: t.id, subject: t.subject, created_at: t.created_at, opens };
+  return { id: t.id, subject: t.subject, recipient: t.recipient || '', sender: t.sender || '', created_at: t.created_at, opens };
 }
 
 async function listTracks(limit = 50) {
   if (usePostgres) {
     const r = await pgPool.query(
-      `SELECT t.id, t.subject, t.created_at,
+      `SELECT t.id, t.subject, t.recipient, t.sender, t.created_at,
               COUNT(o.id) AS open_count,
               MIN(o.opened_at) AS first_open,
               MAX(o.opened_at) AS last_open,
@@ -157,6 +187,8 @@ async function listTracks(limit = 50) {
     return r.rows.map((x) => ({
       id: x.id,
       subject: x.subject,
+      recipient: x.recipient || '',
+      sender: x.sender || '',
       created_at: x.created_at.toISOString(),
       open_count: Number(x.open_count),
       first_open: x.first_open ? x.first_open.toISOString() : null,
@@ -165,7 +197,7 @@ async function listTracks(limit = 50) {
     }));
   }
   const rows = sqliteDb.prepare(
-    `SELECT t.id, t.subject, t.created_at,
+    `SELECT t.id, t.subject, t.recipient, t.sender, t.created_at,
             COUNT(o.id) AS open_count,
             MIN(o.opened_at) AS first_open,
             MAX(o.opened_at) AS last_open,
@@ -176,6 +208,8 @@ async function listTracks(limit = 50) {
   return rows.map((x) => ({
     id: x.id,
     subject: x.subject,
+    recipient: x.recipient || '',
+    sender: x.sender || '',
     created_at: x.created_at,
     open_count: x.open_count,
     first_open: x.first_open,
@@ -184,11 +218,11 @@ async function listTracks(limit = 50) {
   }));
 }
 
-// Per-track summary rows for a date range (used by weekly reports).
+// Per-track summary rows for a date range (used by weekly/monthly reports).
 async function reportSummary(fromISO, toISO) {
   if (usePostgres) {
     const r = await pgPool.query(
-      `SELECT t.id, t.subject, t.created_at,
+      `SELECT t.id, t.subject, t.recipient, t.sender, t.created_at,
               COUNT(o.id) AS open_count,
               MIN(o.opened_at) AS first_open,
               MAX(o.opened_at) AS last_open,
@@ -201,6 +235,8 @@ async function reportSummary(fromISO, toISO) {
     return r.rows.map((x) => ({
       track_id: x.id,
       subject: x.subject,
+      recipient: x.recipient || '',
+      sender: x.sender || '',
       sent_at: x.created_at.toISOString(),
       opens: Number(x.open_count),
       first_open: x.first_open ? x.first_open.toISOString() : '',
@@ -209,7 +245,7 @@ async function reportSummary(fromISO, toISO) {
     }));
   }
   const rows = sqliteDb.prepare(
-    `SELECT t.id, t.subject, t.created_at,
+    `SELECT t.id, t.subject, t.recipient, t.sender, t.created_at,
             COUNT(o.id) AS open_count,
             MIN(o.opened_at) AS first_open,
             MAX(o.opened_at) AS last_open,
@@ -221,6 +257,8 @@ async function reportSummary(fromISO, toISO) {
   return rows.map((x) => ({
     track_id: x.id,
     subject: x.subject,
+    recipient: x.recipient || '',
+    sender: x.sender || '',
     sent_at: x.created_at,
     opens: x.open_count,
     first_open: x.first_open || '',
@@ -229,4 +267,4 @@ async function reportSummary(fromISO, toISO) {
   }));
 }
 
-module.exports = { init, createTrack, logOpen, getTrack, listTracks, reportSummary, backend: () => (usePostgres ? 'postgres' : 'sqlite') };
+module.exports = { init, createTrack, updateTrack, logOpen, getTrack, listTracks, reportSummary, backend: () => (usePostgres ? 'postgres' : 'sqlite') };

@@ -2,12 +2,15 @@
 //
 // Endpoints:
 //   GET  /health                       -> { ok, backend, time }
-//   GET  /api/create-track?subject=..  -> { trackId }
-//   GET  /track/:id.gif                -> 1x1 transparent pixel (logs the open)
+//   GET  /api/create-track?subject=..&to=..&from=.. -> { trackId }
+//   GET  /api/update-track/:id?subject=..&to=..&from=.. -> { ok }
+//   GET  /px/:id.gif                   -> 1x1 transparent pixel (logs the open)
 //   GET  /api/status/:id               -> track + full open log
 //   GET  /api/tracks?limit=50          -> recent tracks with open counts
 //   GET  /report/weekly                -> pretty HTML weekly report (this week, Mon-Sun UTC)
+//   GET  /report/monthly               -> pretty HTML monthly report (this month, UTC)
 //   GET  /api/report/weekly?format=csv -> CSV download of this week's report
+//   GET  /api/report/monthly?format=csv -> CSV download of this month's report
 //   GET  /api/report?from=YYYY-MM-DD&to=YYYY-MM-DD&format=csv|json
 //
 // Run:  npm install && npm start          (PORT env, default 3000)
@@ -54,11 +57,28 @@ app.get('/health', (req, res) => {
 app.get('/api/create-track', async (req, res) => {
   try {
     const subject = typeof req.query.subject === 'string' ? req.query.subject.slice(0, 300) : '';
-    const trackId = await db.createTrack(subject);
+    const to = typeof req.query.to === 'string' ? req.query.to.slice(0, 300) : '';
+    const from = typeof req.query.from === 'string' ? req.query.from.slice(0, 200) : '';
+    const trackId = await db.createTrack(subject, to, from);
     res.json({ trackId });
   } catch (e) {
     console.error('create-track failed:', e.message);
     res.status(500).json({ error: 'could not create track' });
+  }
+});
+
+// Update subject/recipient/sender — compose values are final only at send time.
+app.get('/api/update-track/:id', async (req, res) => {
+  try {
+    const ok = await db.updateTrack(req.params.id, {
+      subject: typeof req.query.subject === 'string' ? req.query.subject : undefined,
+      recipient: typeof req.query.to === 'string' ? req.query.to : undefined,
+      sender: typeof req.query.from === 'string' ? req.query.from : undefined,
+    });
+    res.json({ ok });
+  } catch (e) {
+    console.error('update-track failed:', e.message);
+    res.status(500).json({ error: 'could not update track' });
   }
 });
 
@@ -117,14 +137,21 @@ function currentWeekRangeUTC() {
   return { from: from.toISOString(), to: to.toISOString(), label: from.toISOString().slice(0, 10) };
 }
 
-function parseRange(q) {
+function currentMonthRangeUTC() {
+  const now = new Date();
+  const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0));
+  const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0));
+  return { from: from.toISOString(), to: to.toISOString(), label: from.toISOString().slice(0, 7) };
+}
+
+function parseRange(q, kind) {
   if (q.from && q.to) {
     const from = new Date(q.from + 'T00:00:00Z');
     const to = new Date(q.to + 'T00:00:00Z');
     if (isNaN(from) || isNaN(to) || to <= from) return null;
     return { from: from.toISOString(), to: to.toISOString(), label: `${q.from}_to_${q.to}` };
   }
-  return currentWeekRangeUTC();
+  return kind === 'month' ? currentMonthRangeUTC() : currentWeekRangeUTC();
 }
 
 function toCSV(rows) {
@@ -132,37 +159,38 @@ function toCSV(rows) {
     const s = String(v == null ? '' : v);
     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
-  const head = ['track_id', 'subject', 'sent_at_utc', 'opens', 'first_open_utc', 'last_open_utc', 'gmail_proxy_opens'];
+  const head = ['track_id', 'recipient', 'subject', 'sender', 'sent_at_utc', 'opens', 'first_open_utc', 'last_open_utc', 'gmail_proxy_opens'];
   const lines = [head.join(',')];
   for (const r of rows) {
-    lines.push([r.track_id, r.subject, r.sent_at, r.opens, r.first_open, r.last_open, r.proxy_opens].map(esc).join(','));
+    lines.push([r.track_id, r.recipient, r.subject, r.sender, r.sent_at, r.opens, r.first_open, r.last_open, r.proxy_opens].map(esc).join(','));
   }
   return lines.join('\r\n');
 }
 
-function reportHTML(rows, label) {
+function reportHTML(rows, label, kind) {
+  const slug = kind.toLowerCase(); // 'weekly' | 'monthly'
   const totalOpens = rows.reduce((a, r) => a + r.opens, 0);
   const opened = rows.filter((r) => r.opens > 0).length;
   const trs = rows
     .map(
-      (r) => `<tr><td>${escapeHtml(r.subject) || '<i>(no subject)</i>'}</td>
+      (r) => `<tr><td>${escapeHtml(r.recipient) || '<i>—</i>'}</td><td>${escapeHtml(r.subject) || '<i>(no subject)</i>'}</td>
 <td class="c">${r.opens}</td><td class="c">${r.proxy_opens}</td>
 <td>${escapeHtml(fmt(r.sent_at))}</td><td>${escapeHtml(fmt(r.first_open))}</td><td>${escapeHtml(fmt(r.last_open))}</td></tr>`
     )
     .join('');
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ProMail Tracker — Weekly Report (${escapeHtml(label)})</title>
+<title>ProMail Tracker — ${kind} Report (${escapeHtml(label)})</title>
 <style>body{font-family:system-ui,Arial,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#222}
 h1{font-size:22px}.stats{display:flex;gap:16px;margin:16px 0}.stat{background:#f4f6f8;border-radius:10px;padding:12px 18px}
 .stat b{font-size:22px;display:block}.c{text-align:center}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{border:1px solid #ddd;padding:8px 10px;text-align:left}th{background:#f4f6f8}
 a.btn{display:inline-block;margin-top:16px;padding:10px 16px;background:#0b7a55;color:#fff;border-radius:8px;text-decoration:none}</style>
 </head><body>
-<h1>📧 Weekly Email Report <small>(${escapeHtml(label)})</small></h1>
+<h1>📧 ${kind} Email Report <small>(${escapeHtml(label)})</small></h1>
 <div class="stats"><div class="stat"><b>${rows.length}</b>emails tracked</div>
 <div class="stat"><b>${opened}</b>opened</div><div class="stat"><b>${totalOpens}</b>total opens</div></div>
-<table><tr><th>Subject</th><th>Opens</th><th>Proxy</th><th>Sent (UTC)</th><th>First open</th><th>Last open</th></tr>${trs || '<tr><td colspan="6">No tracked emails this week.</td></tr>'}</table>
-<a class="btn" href="/api/report/weekly?format=csv">⬇ Download CSV</a>
+<table><tr><th>To</th><th>Subject</th><th>Opens</th><th>Proxy</th><th>Sent (UTC)</th><th>First open</th><th>Last open</th></tr>${trs || `<tr><td colspan="7">No tracked emails this ${slug === 'monthly' ? 'month' : 'week'}.</td></tr>`}</table>
+<a class="btn" href="/api/report/${slug}?format=csv">⬇ Download CSV</a>
 <p style="color:#777;font-size:12px">“Proxy” = opens via Gmail's image proxy (Gmail pre-loads images, so treat the first proxy open cautiously). Data is kept permanently on the server.</p>
 </body></html>`;
 }
@@ -177,20 +205,33 @@ function fmt(iso) {
 
 app.get('/report/weekly', async (req, res) => {
   try {
-    const range = parseRange(req.query);
+    const range = parseRange(req.query, 'week');
     if (!range) return res.status(400).send('Bad date range. Use ?from=YYYY-MM-DD&to=YYYY-MM-DD');
     const rows = await db.reportSummary(range.from, range.to);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(reportHTML(rows, range.label));
+    res.send(reportHTML(rows, range.label, 'Weekly'));
   } catch (e) {
     console.error('weekly html failed:', e.message);
     res.status(500).send('report failed');
   }
 });
 
+app.get('/report/monthly', async (req, res) => {
+  try {
+    const range = parseRange(req.query, 'month');
+    if (!range) return res.status(400).send('Bad date range. Use ?from=YYYY-MM-DD&to=YYYY-MM-DD');
+    const rows = await db.reportSummary(range.from, range.to);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(reportHTML(rows, range.label, 'Monthly'));
+  } catch (e) {
+    console.error('monthly html failed:', e.message);
+    res.status(500).send('report failed');
+  }
+});
+
 app.get(['/api/report/weekly', '/api/report'], async (req, res) => {
   try {
-    const range = parseRange(req.query);
+    const range = parseRange(req.query, 'week');
     if (!range) return res.status(400).json({ error: 'Bad date range. Use from=YYYY-MM-DD&to=YYYY-MM-DD' });
     const rows = await db.reportSummary(range.from, range.to);
     const format = (req.query.format || 'json').toLowerCase();
@@ -202,6 +243,24 @@ app.get(['/api/report/weekly', '/api/report'], async (req, res) => {
     res.json({ week: range.label, from: range.from, to: range.to, total: rows.length, rows });
   } catch (e) {
     console.error('report api failed:', e.message);
+    res.status(500).json({ error: 'report failed' });
+  }
+});
+
+app.get('/api/report/monthly', async (req, res) => {
+  try {
+    const range = parseRange(req.query, 'month');
+    if (!range) return res.status(400).json({ error: 'Bad date range. Use from=YYYY-MM-DD&to=YYYY-MM-DD' });
+    const rows = await db.reportSummary(range.from, range.to);
+    const format = (req.query.format || 'json').toLowerCase();
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="promail-monthly-${range.label}.csv"`);
+      return res.send('\uFEFF' + toCSV(rows));
+    }
+    res.json({ month: range.label, from: range.from, to: range.to, total: rows.length, rows });
+  } catch (e) {
+    console.error('monthly api failed:', e.message);
     res.status(500).json({ error: 'report failed' });
   }
 });
