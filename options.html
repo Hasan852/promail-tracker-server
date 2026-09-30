@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ProMail Tracker — Settings</title>
+<style>
+  body { font-family: system-ui, Arial, sans-serif; max-width: 560px; margin: 32px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 20px; }
+  label { font-weight: 600; font-size: 14px; }
+  input { width: 100%; padding: 10px; font-size: 14px; margin: 8px 0 4px; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
+  .hint { font-size: 12px; color: #666; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button { padding: 10px 18px; border-radius: 8px; cursor: pointer; font-size: 14px; border: 1px solid #0b7a55; background: #fff; color: #0b7a55; }
+  button.primary { background: #0b7a55; color: #fff; border: none; }
+  #msg { margin-top: 12px; font-size: 14px; min-height: 20px; }
+  .ok { color: #0b7a55; } .err { color: #c0392b; }
+  ol { font-size: 14px; line-height: 1.7; }
+  code { background: #f4f6f8; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>⚙ ProMail Tracker — Settings</h1>
+
+<label for="url">Tracker server URL</label>
+<input id="url" type="url" placeholder="https://your-tracker.onrender.com" spellcheck="false">
+<div class="hint">Must start with <code>https://</code> (spam filters distrust http pixels). No trailing slash needed.</div>
+<div class="row">
+  <button id="save" class="primary">Save</button>
+  <button id="test">Test connection</button>
+</div>
+<div id="msg"></div>
+
+<h2 style="font-size:16px;margin-top:28px">How it stays out of spam</h2>
+<ol>
+  <li>Only <b>one 1×1 image</b> is added to each email — nothing else in your message is changed.</li>
+  <li>The pixel URL is <b>clean HTTPS</b> with no query strings, redirects, or cookies.</li>
+  <li>No hidden <code>display:none</code> tricks — just a plain tiny image, the most filter-friendly form.</li>
+  <li>If the server is down, your email is sent <b>completely untouched</b>.</li>
+</ol>
+<p class="hint">Note: the pixel itself is spam-neutral. Inbox placement still depends on your sending domain's reputation (SPF/DKIM/DMARC), subject lines, and sending volume — keep those healthy as usual.</p>
+
+<script src="options.js"></script>
+</body>
+</html>
