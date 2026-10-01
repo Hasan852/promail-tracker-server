@@ -2,11 +2,12 @@
 //
 // Endpoints:
 //   GET  /health                       -> { ok, backend, time }
-//   GET  /api/create-track?subject=..&to=..&from=.. -> { trackId }
-//   GET  /api/update-track/:id?subject=..&to=..&from=.. -> { ok }
+//   GET  /api/create-track?subject=..&to=..&from=..&deferred=1 -> { trackId }
+//   GET  /api/update-track/:id?subject=..&to=..&from=..&sent=1 -> { ok }
+//   GET  /api/self-view/:id              -> sender viewed own sent mail (v1.4: suppress own opens)
 //   GET  /px/:id.gif                   -> 1x1 transparent pixel (logs the open)
 //   GET  /api/status/:id               -> track + full open log
-//   GET  /api/tracks?limit=50          -> recent tracks with open counts
+//   GET  /api/tracks?limit=50&all=1     -> recent tracks with open counts
 //   GET  /report/weekly                -> pretty HTML weekly report (this week, Mon-Sun UTC)
 //   GET  /report/monthly               -> pretty HTML monthly report (this month, UTC)
 //   GET  /api/report/weekly?format=csv -> CSV download of this week's report
@@ -54,12 +55,16 @@ app.get('/health', (req, res) => {
 });
 
 // Create a tracking ID for one outgoing email.
+// v1.3: pass deferred=1 when the caller will mark the mail as sent later
+// (only then do pixel hits count as opens). Without it, the track is
+// immediately live — keeps pre-v1.3 extensions working unchanged.
 app.get('/api/create-track', async (req, res) => {
   try {
     const subject = typeof req.query.subject === 'string' ? req.query.subject.slice(0, 300) : '';
     const to = typeof req.query.to === 'string' ? req.query.to.slice(0, 300) : '';
     const from = typeof req.query.from === 'string' ? req.query.from.slice(0, 200) : '';
-    const trackId = await db.createTrack(subject, to, from);
+    const deferred = req.query.deferred === '1';
+    const trackId = await db.createTrack(subject, to, from, { deferred });
     res.json({ trackId });
   } catch (e) {
     console.error('create-track failed:', e.message);
@@ -68,17 +73,35 @@ app.get('/api/create-track', async (req, res) => {
 });
 
 // Update subject/recipient/sender — compose values are final only at send time.
+// Pass sent=1 to mark the mail as actually sent (v1.3+).
 app.get('/api/update-track/:id', async (req, res) => {
   try {
     const ok = await db.updateTrack(req.params.id, {
       subject: typeof req.query.subject === 'string' ? req.query.subject : undefined,
       recipient: typeof req.query.to === 'string' ? req.query.to : undefined,
       sender: typeof req.query.from === 'string' ? req.query.from : undefined,
+      sent: req.query.sent === '1' ? 1 : req.query.sent === '0' ? 0 : undefined,
     });
     res.json({ ok });
   } catch (e) {
     console.error('update-track failed:', e.message);
     res.status(500).json({ error: 'could not update track' });
+  }
+});
+
+// v1.4: self-view signal. The extension calls this when the sender opens
+// their own sent mail in Gmail. Opens arriving inside the suppression window
+// are the sender's own views — they are NOT counted and never notify.
+// Only the receiver's opens count.
+app.get('/api/self-view/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!/^trk_[A-Za-z0-9]+$/.test(id)) return res.status(400).json({ error: 'bad id' });
+    const r = await db.recordSelfView(id);
+    res.json({ ok: r.recorded, removedSelfOpens: r.removed || 0 });
+  } catch (e) {
+    console.error('self-view failed:', e.message);
+    res.status(500).json({ error: 'could not record self-view' });
   }
 });
 
@@ -120,7 +143,10 @@ app.get('/api/status/:id', async (req, res) => {
 app.get('/api/tracks', async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
-    res.json(await db.listTracks(limit));
+    // all=1 also returns drafts (sent=0) — used internally; the popup and
+    // reports use the default sent-only view.
+    const includeUnsent = req.query.all === '1';
+    res.json(await db.listTracks(limit, includeUnsent));
   } catch (e) {
     console.error('tracks failed:', e.message);
     res.status(500).json({ error: 'lookup failed' });
