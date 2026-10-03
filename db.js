@@ -123,7 +123,14 @@ function newId() {
 }
 
 async function createTrack(subject, recipient, sender, opts = {}) {
-  const id = newId();
+  // v1.7.0: the extension generates the id client-side (instant pixel, no
+  // server round-trip at compose). Accept it via opts.id (strictly validated);
+  // upsert so retries and double-commits are idempotent. Callers without an
+  // id keep the old server-generated behavior.
+  let id = opts.id;
+  if (!(typeof id === 'string' && /^trk_[A-Za-z0-9]{12}$/.test(id))) {
+    id = newId();
+  }
   const createdAt = new Date().toISOString();
   const r = (recipient || '').slice(0, 300);
   const s = (sender || '').slice(0, 200);
@@ -131,9 +138,17 @@ async function createTrack(subject, recipient, sender, opts = {}) {
   // sends (v1.3+); legacy callers without the flag keep the old behavior (1).
   const sent = opts.deferred ? 0 : 1;
   if (usePostgres) {
-    await pgPool.query('INSERT INTO tracks (id, subject, recipient, sender, sent, created_at) VALUES ($1, $2, $3, $4, $5, $6)', [id, subject || '', r, s, sent, createdAt]);
+    await pgPool.query(
+      `INSERT INTO tracks (id, subject, recipient, sender, sent, created_at) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (id) DO UPDATE SET subject = EXCLUDED.subject, recipient = EXCLUDED.recipient,
+         sender = EXCLUDED.sender, sent = EXCLUDED.sent`,
+      [id, subject || '', r, s, sent, createdAt]);
   } else {
-    sqliteDb.prepare('INSERT INTO tracks (id, subject, recipient, sender, sent, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, subject || '', r, s, sent, createdAt);
+    sqliteDb.prepare(
+      `INSERT INTO tracks (id, subject, recipient, sender, sent, created_at) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET subject = excluded.subject, recipient = excluded.recipient,
+         sender = excluded.sender, sent = excluded.sent`
+    ).run(id, subject || '', r, s, sent, createdAt);
   }
   return id;
 }

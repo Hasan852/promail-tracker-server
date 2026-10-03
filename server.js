@@ -55,16 +55,20 @@ app.get('/health', (req, res) => {
 });
 
 // Create a tracking ID for one outgoing email.
-// v1.3: pass deferred=1 when the caller will mark the mail as sent later
-// (only then do pixel hits count as opens). Without it, the track is
-// immediately live — keeps pre-v1.3 extensions working unchanged.
+// v1.7.0: the extension generates the id client-side and passes it as
+// ?id=trk_............ (strictly validated); the db upserts on id so
+// retries/double-commits are idempotent. Callers without id keep the old
+// server-generated behavior. deferred=1 (pre-v1.7 extensions) still works.
 app.get('/api/create-track', async (req, res) => {
   try {
     const subject = typeof req.query.subject === 'string' ? req.query.subject.slice(0, 300) : '';
     const to = typeof req.query.to === 'string' ? req.query.to.slice(0, 300) : '';
     const from = typeof req.query.from === 'string' ? req.query.from.slice(0, 200) : '';
     const deferred = req.query.deferred === '1';
-    const trackId = await db.createTrack(subject, to, from, { deferred });
+    const id = typeof req.query.id === 'string' && /^trk_[A-Za-z0-9]{12}$/.test(req.query.id)
+      ? req.query.id
+      : undefined;
+    const trackId = await db.createTrack(subject, to, from, { deferred, id });
     res.json({ trackId });
   } catch (e) {
     console.error('create-track failed:', e.message);
