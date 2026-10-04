@@ -24,11 +24,24 @@ const db = require('./db');
 
 const app = express();
 app.set('trust proxy', true); // honor X-Forwarded-For on Render/Railway/etc.
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()) : true, methods: ['GET','POST','OPTIONS'] }));
 app.use(express.json());
 
 // 1x1 transparent GIF
 const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+
+
+async function requireAuth(req, res, next) {
+  try {
+    const token = req.get('X-PMT-Key');
+    if (!token || token.length < 36) return res.status(401).json({ error: 'authentication required' });
+    req.ownerId = await db.ensureAccount(token);
+    next();
+  } catch (e) {
+    console.error('auth failed:', e.message);
+    res.status(401).json({ error: 'authentication failed' });
+  }
+}
 
 function clientIp(req) {
   const fwd = req.headers['x-forwarded-for'];
@@ -54,12 +67,18 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, backend: db.backend(), time: new Date().toISOString() });
 });
 
+// Register/restore this extension installation. The token is generated locally
+// and never stored in plaintext server-side; only its SHA-256 hash is kept.
+app.post('/api/bootstrap', requireAuth, async (req, res) => {
+  res.json({ ok: true, accountId: req.ownerId });
+});
+
 // Create a tracking ID for one outgoing email.
 // v1.7.0: the extension generates the id client-side and passes it as
 // ?id=trk_............ (strictly validated); the db upserts on id so
 // retries/double-commits are idempotent. Callers without id keep the old
 // server-generated behavior. deferred=1 (pre-v1.7 extensions) still works.
-app.get('/api/create-track', async (req, res) => {
+app.get('/api/create-track', requireAuth, async (req, res) => {
   try {
     const subject = typeof req.query.subject === 'string' ? req.query.subject.slice(0, 300) : '';
     const to = typeof req.query.to === 'string' ? req.query.to.slice(0, 300) : '';
@@ -68,7 +87,7 @@ app.get('/api/create-track', async (req, res) => {
     const id = typeof req.query.id === 'string' && /^trk_[A-Za-z0-9]{12}$/.test(req.query.id)
       ? req.query.id
       : undefined;
-    const trackId = await db.createTrack(subject, to, from, { deferred, id });
+    const trackId = await db.createTrack(subject, to, from, { deferred, id, ownerId: req.ownerId });
     res.json({ trackId });
   } catch (e) {
     console.error('create-track failed:', e.message);
@@ -78,9 +97,9 @@ app.get('/api/create-track', async (req, res) => {
 
 // Update subject/recipient/sender — compose values are final only at send time.
 // Pass sent=1 to mark the mail as actually sent (v1.3+).
-app.get('/api/update-track/:id', async (req, res) => {
+app.get('/api/update-track/:id', requireAuth, async (req, res) => {
   try {
-    const ok = await db.updateTrack(req.params.id, {
+    const ok = await db.updateTrack(req.params.id, req.ownerId, {
       subject: typeof req.query.subject === 'string' ? req.query.subject : undefined,
       recipient: typeof req.query.to === 'string' ? req.query.to : undefined,
       sender: typeof req.query.from === 'string' ? req.query.from : undefined,
@@ -97,11 +116,11 @@ app.get('/api/update-track/:id', async (req, res) => {
 // their own sent mail in Gmail. Opens arriving inside the suppression window
 // are the sender's own views — they are NOT counted and never notify.
 // Only the receiver's opens count.
-app.get('/api/self-view/:id', async (req, res) => {
+app.get('/api/self-view/:id', requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!/^trk_[A-Za-z0-9]+$/.test(id)) return res.status(400).json({ error: 'bad id' });
-    const r = await db.recordSelfView(id);
+    const r = await db.recordSelfView(id, req.ownerId);
     res.json({ ok: r.recorded, removedSelfOpens: r.removed || 0 });
   } catch (e) {
     console.error('self-view failed:', e.message);
@@ -133,9 +152,9 @@ app.get('/px/:id.gif', async (req, res) => {
   res.send(PIXEL);
 });
 
-app.get('/api/status/:id', async (req, res) => {
+app.get('/api/status/:id', requireAuth, async (req, res) => {
   try {
-    const track = await db.getTrack(req.params.id);
+    const track = await db.getTrack(req.params.id, req.ownerId);
     if (!track) return res.status(404).json({ error: 'Tracking ID not found' });
     res.json(track);
   } catch (e) {
@@ -144,13 +163,13 @@ app.get('/api/status/:id', async (req, res) => {
   }
 });
 
-app.get('/api/tracks', async (req, res) => {
+app.get('/api/tracks', requireAuth, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     // all=1 also returns drafts (sent=0) — used internally; the popup and
     // reports use the default sent-only view.
     const includeUnsent = req.query.all === '1';
-    res.json(await db.listTracks(limit, includeUnsent));
+    res.json(await db.listTracks(req.ownerId, limit, includeUnsent));
   } catch (e) {
     console.error('tracks failed:', e.message);
     res.status(500).json({ error: 'lookup failed' });
@@ -201,6 +220,7 @@ function reportHTML(rows, label, kind) {
   const slug = kind.toLowerCase(); // 'weekly' | 'monthly'
   const totalOpens = rows.reduce((a, r) => a + r.opens, 0);
   const opened = rows.filter((r) => r.opens > 0).length;
+  const openRate = rows.length ? Math.round((opened / rows.length) * 100) : 0;
   const trs = rows
     .map(
       (r) => `<tr><td>${escapeHtml(r.recipient) || '<i>—</i>'}</td><td>${escapeHtml(r.subject) || '<i>(no subject)</i>'}</td>
@@ -218,7 +238,7 @@ a.btn{display:inline-block;margin-top:16px;padding:10px 16px;background:#0b7a55;
 </head><body>
 <h1>📧 ${kind} Email Report <small>(${escapeHtml(label)})</small></h1>
 <div class="stats"><div class="stat"><b>${rows.length}</b>emails tracked</div>
-<div class="stat"><b>${opened}</b>opened</div><div class="stat"><b>${totalOpens}</b>total opens</div></div>
+<div class="stat"><b>${opened}</b>opened</div><div class="stat"><b>${totalOpens}</b>total opens</div><div class="stat"><b>${openRate}%</b>open rate</div></div>
 <table><tr><th>To</th><th>Subject</th><th>Opens</th><th>Proxy</th><th>Sent (UTC)</th><th>First open</th><th>Last open</th></tr>${trs || `<tr><td colspan="7">No tracked emails this ${slug === 'monthly' ? 'month' : 'week'}.</td></tr>`}</table>
 <a class="btn" href="/api/report/${slug}?format=csv">⬇ Download CSV</a>
 <p style="color:#777;font-size:12px">“Proxy” = opens via Gmail's image proxy (Gmail pre-loads images, so treat the first proxy open cautiously). Data is kept permanently on the server.</p>
@@ -233,11 +253,11 @@ function fmt(iso) {
   return iso.replace('T', ' ').slice(0, 19);
 }
 
-app.get('/report/weekly', async (req, res) => {
+app.get('/report/weekly', requireAuth, async (req, res) => {
   try {
     const range = parseRange(req.query, 'week');
     if (!range) return res.status(400).send('Bad date range. Use ?from=YYYY-MM-DD&to=YYYY-MM-DD');
-    const rows = await db.reportSummary(range.from, range.to);
+    const rows = await db.reportSummary(req.ownerId, range.from, range.to);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(reportHTML(rows, range.label, 'Weekly'));
   } catch (e) {
@@ -246,11 +266,11 @@ app.get('/report/weekly', async (req, res) => {
   }
 });
 
-app.get('/report/monthly', async (req, res) => {
+app.get('/report/monthly', requireAuth, async (req, res) => {
   try {
     const range = parseRange(req.query, 'month');
     if (!range) return res.status(400).send('Bad date range. Use ?from=YYYY-MM-DD&to=YYYY-MM-DD');
-    const rows = await db.reportSummary(range.from, range.to);
+    const rows = await db.reportSummary(req.ownerId, range.from, range.to);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(reportHTML(rows, range.label, 'Monthly'));
   } catch (e) {
@@ -259,11 +279,11 @@ app.get('/report/monthly', async (req, res) => {
   }
 });
 
-app.get(['/api/report/weekly', '/api/report'], async (req, res) => {
+app.get(['/api/report/weekly', '/api/report'], requireAuth, async (req, res) => {
   try {
     const range = parseRange(req.query, 'week');
     if (!range) return res.status(400).json({ error: 'Bad date range. Use from=YYYY-MM-DD&to=YYYY-MM-DD' });
-    const rows = await db.reportSummary(range.from, range.to);
+    const rows = await db.reportSummary(req.ownerId, range.from, range.to);
     const format = (req.query.format || 'json').toLowerCase();
     if (format === 'csv') {
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -277,11 +297,11 @@ app.get(['/api/report/weekly', '/api/report'], async (req, res) => {
   }
 });
 
-app.get('/api/report/monthly', async (req, res) => {
+app.get('/api/report/monthly', requireAuth, async (req, res) => {
   try {
     const range = parseRange(req.query, 'month');
     if (!range) return res.status(400).json({ error: 'Bad date range. Use from=YYYY-MM-DD&to=YYYY-MM-DD' });
-    const rows = await db.reportSummary(range.from, range.to);
+    const rows = await db.reportSummary(req.ownerId, range.from, range.to);
     const format = (req.query.format || 'json').toLowerCase();
     if (format === 'csv') {
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');

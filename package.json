@@ -1,1 +1,1 @@
-{"dependencies":{"cors":"^2.8.5","express":"^4.19.2","pg":"^8.13.1"},"description":"Backend for ProMail Tracker — private, real-time email open tracking","engines":{"node":">=22"},"main":"server.js","name":"promail-tracker-server","scripts":{"start":"node server.js"},"version":"1.0.0"}
+{"dependencies":{"cors":"^2.8.5","express":"^4.19.2","pg":"^8.13.1"},"description":"Backend for ProMail Tracker \u2014 private, real-time email open tracking","engines":{"node":">=22"},"main":"server.js","name":"promail-tracker-server","scripts":{"start":"node server.js"},"version":"2.1.0"}
