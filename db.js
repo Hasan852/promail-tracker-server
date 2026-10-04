@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS opens (
   is_gmail_proxy INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_opens_track ON opens(track_id);
-CREATE INDEX IF NOT EXISTS idx_tracks_owner_created ON tracks(owner_id, created_at);
 CREATE TABLE IF NOT EXISTS self_views (
   track_id TEXT PRIMARY KEY,
   viewed_at TEXT NOT NULL
@@ -65,7 +64,6 @@ CREATE TABLE IF NOT EXISTS opens (
   is_gmail_proxy BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_opens_track ON opens(track_id);
-CREATE INDEX IF NOT EXISTS idx_tracks_owner_created ON tracks(owner_id, created_at);
 CREATE TABLE IF NOT EXISTS self_views (
   track_id TEXT PRIMARY KEY,
   viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -90,6 +88,8 @@ async function init() {
     await pgPool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS recipient TEXT NOT NULL DEFAULT ''`);
     await pgPool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS sender TEXT NOT NULL DEFAULT ''`);
     await pgPool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS sent INTEGER NOT NULL DEFAULT 0`);
+    // Create this index only after the legacy-table migrations add owner_id.
+    await pgPool.query('CREATE INDEX IF NOT EXISTS idx_tracks_owner_created ON tracks(owner_id, created_at)');
     // Existing records belong to the old single-user deployment and are not exposed to new accounts.
     console.log('[db] using Postgres');
   } else {
@@ -105,6 +105,7 @@ async function init() {
       sqliteDb.exec(`ALTER TABLE tracks ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`);
       sqliteDb.exec(`UPDATE tracks SET sent = 1`);
     }
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_tracks_owner_created ON tracks(owner_id, created_at)');
     console.log('[db] using SQLite file:', file);
   }
 }
