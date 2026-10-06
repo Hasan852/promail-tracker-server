@@ -208,10 +208,10 @@ function toCSV(rows) {
     const s = String(v == null ? '' : v);
     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
-  const head = ['track_id', 'recipient', 'subject', 'sender', 'sent_at_utc', 'opens', 'first_open_utc', 'last_open_utc', 'gmail_proxy_opens'];
+  const head = ['track_id', 'recipient', 'subject', 'sent_at_utc', 'opens', 'first_open_utc', 'last_open_utc', 'gmail_proxy_opens'];
   const lines = [head.join(',')];
   for (const r of rows) {
-    lines.push([r.track_id, r.recipient, r.subject, r.sender, r.sent_at, r.opens, r.first_open, r.last_open, r.proxy_opens].map(esc).join(','));
+    lines.push([r.track_id, r.recipient, r.subject, r.sent_at, r.opens, r.first_open, r.last_open, r.proxy_opens].map(esc).join(','));
   }
   return lines.join('\r\n');
 }
