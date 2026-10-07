@@ -126,7 +126,7 @@ describe('database + API', () => {
     const r = await fetch(BASE + '/health');
     const j = await r.json();
     assert.equal(j.ok, true);
-    assert.equal(j.version, '2.3.0');
+    assert.equal(j.version, '2.4.0');
   });
 
   test('auth: missing/invalid token -> 401', async () => {
@@ -407,6 +407,84 @@ describe('database + API', () => {
       const html = await res.text();
       assert.ok(html.includes('Privacy Policy'));
       assert.ok(html.includes('never read your Gmail'));
+    });
+  });
+
+  describe('v2.4.0: follow-up chains + primary recipient', () => {
+    const { normThreadSubject, primaryRecipient } = db;
+
+    test('normThreadSubject strips nested prefixes', () => {
+      assert.equal(normThreadSubject('Re: Re: Launch Plan'), 'launch plan');
+      assert.equal(normThreadSubject('FWD: hello'), 'hello');
+      assert.equal(normThreadSubject('fw:  spaced  out '), 'spaced out');
+      assert.equal(normThreadSubject('Hello'), 'hello');
+      assert.equal(normThreadSubject(''), '');
+    });
+
+    test('primaryRecipient filters automated addresses', () => {
+      assert.equal(primaryRecipient('noreply@x.com, alice@y.com', 'me@z.com'), 'alice@y.com');
+      assert.equal(primaryRecipient('noreply-accounts@google.com, noreply@mailer.ashna.ai', ''), 'noreply-accounts@google.com', 'fallback to first when all automated');
+      assert.equal(primaryRecipient('me@z.com, bob@y.com', 'me@z.com'), 'bob@y.com', 'sender excluded');
+      assert.equal(primaryRecipient('mailer-daemon@googlemail.com, carol@y.com', ''), 'carol@y.com');
+      assert.equal(primaryRecipient('', ''), '');
+      assert.equal(primaryRecipient('  ', 'me@z.com'), '');
+    });
+
+    test('commit links follow-up to parent; unrelated mail stays root', async () => {
+      const subj = 'V24 chain ' + Date.now();
+      const a = newTid();
+      await api('POST', '/api/tracks', TOKEN_A, { id: a, subject: subj, to: 'alice@y.com', from: 'me@z.com' });
+      const ka = await api('POST', `/api/tracks/${a}/commit`, TOKEN_A, { subject: subj, to: 'alice@y.com', from: 'me@z.com' });
+      assert.equal(ka.status, 200);
+      assert.equal(ka.json.parentTrackId, null, 'first mail has no parent');
+
+      const b = newTid();
+      await api('POST', '/api/tracks', TOKEN_A, { id: b, subject: 'Re: ' + subj, to: 'alice@y.com', from: 'me@z.com' });
+      const kb = await api('POST', `/api/tracks/${b}/commit`, TOKEN_A, { subject: 'Re: ' + subj, to: 'alice@y.com', from: 'me@z.com' });
+      assert.equal(kb.status, 200);
+      assert.equal(kb.json.parentTrackId, a, 'reply links to parent');
+
+      const t = await api('GET', `/api/tracks/${b}`, TOKEN_A);
+      assert.equal(t.json.parent_track_id, a);
+      assert.equal(t.json.primary_recipient, 'alice@y.com');
+
+      // third follow-up chains under the most recent (b)
+      const c = newTid();
+      await api('POST', '/api/tracks', TOKEN_A, { id: c, subject: 'Re: Re: ' + subj, to: 'alice@y.com', from: 'me@z.com' });
+      const kc = await api('POST', `/api/tracks/${c}/commit`, TOKEN_A, { subject: 'Re: Re: ' + subj, to: 'alice@y.com', from: 'me@z.com' });
+      assert.equal(kc.json.parentTrackId, b, 'chains to most recent');
+
+      // unrelated subject: no parent
+      const d = newTid();
+      await api('POST', '/api/tracks', TOKEN_A, { id: d, subject: 'V24 other ' + Date.now(), to: 'alice@y.com', from: 'me@z.com' });
+      const kd = await api('POST', `/api/tracks/${d}/commit`, TOKEN_A, { subject: 'V24 other ' + Date.now(), to: 'alice@y.com' });
+      assert.equal(kd.json.parentTrackId, null);
+
+      // list + report expose the new fields
+      const all = await api('GET', '/api/tracks?all=1', TOKEN_A);
+      const tb = all.json.tracks.find((x) => x.id === b);
+      assert.equal(tb.parent_track_id, a);
+      assert.equal(tb.primary_recipient, 'alice@y.com');
+      const rep = await api('GET', '/api/report/weekly?format=json', TOKEN_A);
+      const rb = rep.json.rows.find((x) => x.track_id === b);
+      assert.equal(rb.parent_track_id, a);
+      assert.equal(rb.primary_recipient, 'alice@y.com');
+
+      // re-commit is idempotent: parent link untouched
+      const kb2 = await api('POST', `/api/tracks/${b}/commit`, TOKEN_A, { subject: 'Re: ' + subj, to: 'alice@y.com' });
+      assert.equal(kb2.json.alreadyCommitted, true);
+      assert.equal(kb2.json.parentTrackId, a);
+    });
+
+    test('parent never crosses owners', async () => {
+      const subj = 'V24 xowner ' + Date.now();
+      const a = newTid();
+      await api('POST', '/api/tracks', TOKEN_A, { id: a, subject: subj, to: 'shared@y.com' });
+      await api('POST', `/api/tracks/${a}/commit`, TOKEN_A, { subject: subj, to: 'shared@y.com' });
+      const b = newTid();
+      await api('POST', '/api/tracks', TOKEN_B, { id: b, subject: 'Re: ' + subj, to: 'shared@y.com' });
+      const kb = await api('POST', `/api/tracks/${b}/commit`, TOKEN_B, { subject: 'Re: ' + subj, to: 'shared@y.com' });
+      assert.equal(kb.json.parentTrackId, null, 'no cross-owner linking');
     });
   });
 });

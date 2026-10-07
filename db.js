@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS tracks (
   subject TEXT NOT NULL DEFAULT '',
   recipient TEXT NOT NULL DEFAULT '',
   sender TEXT NOT NULL DEFAULT '',
+  parent_track_id TEXT,
   sent INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   sent_at TEXT,
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS tracks (
   subject TEXT NOT NULL DEFAULT '',
   recipient TEXT NOT NULL DEFAULT '',
   sender TEXT NOT NULL DEFAULT '',
+  parent_track_id TEXT,
   sent INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   sent_at TIMESTAMPTZ,
@@ -202,6 +204,7 @@ async function init() {
       `owner_id TEXT NOT NULL DEFAULT '${LEGACY_OWNER}'`,
       `recipient TEXT NOT NULL DEFAULT ''`,
       `sender TEXT NOT NULL DEFAULT ''`,
+      'parent_track_id TEXT',
       `sent INTEGER NOT NULL DEFAULT 0`,
       'sent_at TIMESTAMPTZ',
       'updated_at TIMESTAMPTZ',
@@ -223,6 +226,7 @@ async function init() {
     }
     await pgQuery('CREATE INDEX IF NOT EXISTS idx_tracks_owner_created ON tracks(owner_id, created_at)');
     await pgQuery('CREATE INDEX IF NOT EXISTS idx_tracks_owner_updated ON tracks(owner_id, updated_at)');
+    await pgQuery('CREATE INDEX IF NOT EXISTS idx_tracks_parent ON tracks(parent_track_id)');
     await pgQuery('CREATE INDEX IF NOT EXISTS idx_events_track_received ON events(track_id, received_at)');
     await pgQuery('CREATE INDEX IF NOT EXISTS idx_events_track_dedupe ON events(track_id, dedupe_key)');
     log.info('[db] using Postgres');
@@ -236,6 +240,7 @@ async function init() {
     need('owner_id', `owner_id TEXT NOT NULL DEFAULT '${LEGACY_OWNER}'`);
     need('recipient', `recipient TEXT NOT NULL DEFAULT ''`);
     need('sender', `sender TEXT NOT NULL DEFAULT ''`);
+    need('parent_track_id', 'parent_track_id TEXT');
     need('sent', 'sent INTEGER NOT NULL DEFAULT 0');
     need('sent_at', 'sent_at TEXT');
     need('updated_at', 'updated_at TEXT');
@@ -256,6 +261,7 @@ async function init() {
     }
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_tracks_owner_created ON tracks(owner_id, created_at)');
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_tracks_owner_updated ON tracks(owner_id, updated_at)');
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_tracks_parent ON tracks(parent_track_id)');
     log.info('[db] using SQLite file:', file);
   }
   await backfillTrackTimestamps();
@@ -523,6 +529,71 @@ async function getTrackOwner(id) {
   return liteGet('SELECT id, owner_id, sent FROM tracks WHERE id=?', id) || null;
 }
 
+// ---------- follow-up chains (v2.4.0) ----------
+
+// Thread subject: lowercase, collapsed whitespace, Re:/Fwd:/Fw: prefixes
+// stripped (possibly nested), so "Re: Re: Launch plan" and "Launch plan"
+// belong to the same conversation thread.
+function normThreadSubject(s) {
+  let n = String(s || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  let prev;
+  do {
+    prev = n;
+    n = n.replace(/^(re|fwd?|fw)\s*:\s*/, '');
+  } while (n !== prev);
+  return n;
+}
+
+// First listed email address, lowercased. Used as the conversation key.
+function normPrimaryAddress(r) {
+  const parts = String(r || '').split(/[;,]/).map((x) => x.trim()).filter(Boolean);
+  return (parts[0] || '').toLowerCase();
+}
+
+// Local part looks automated (mailing-list / no-reply style address).
+const AUTOMATED_LOCAL_RE = /^(no[-.]?reply|donotreply|do[-.]?not[-.]?reply|mailer[-.]?daemon|postmaster|bounces?|bounce[-.]?back)$/i;
+
+// Display recipient: the first real human address. Automated addresses
+// (noreply@, mailer-daemon@, ...) are skipped; the sender's own address is
+// skipped too. Falls back to the first address when everything looks
+// automated. Never throws; never returns null.
+function primaryRecipient(recipient, sender) {
+  const s = String(sender || '').trim().toLowerCase();
+  const parts = String(recipient || '').split(/[;,]/).map((x) => x.trim()).filter(Boolean);
+  const list = parts.filter((p) => !s || p.toLowerCase() !== s);
+  const cands = list.length ? list : parts;
+  for (const p of cands) {
+    if (!p.includes('@')) continue;
+    const local = p.split('@')[0] || '';
+    if (!AUTOMATED_LOCAL_RE.test(local)) return p;
+  }
+  return cands[0] || '';
+}
+
+// Find the follow-up parent: the most recent SENT track by the same owner
+// with the same thread subject and same primary recipient. Returns the
+// parent track id, or null. Pure lookup — never mutates.
+async function findParentTrack(ownerId, excludeId, subject, recipient) {
+  const ns = normThreadSubject(subject);
+  const nr = normPrimaryAddress(recipient);
+  if (!ns || !nr) return null;
+  const rows = usePostgres
+    ? (await pgQuery(
+        `SELECT id, subject, recipient, sent_at FROM tracks
+         WHERE owner_id=$1 AND id!=$2 AND sent=1
+         ORDER BY sent_at DESC NULLS LAST, created_at DESC LIMIT 25`,
+        [ownerId, excludeId])).rows
+    : liteAll(
+        `SELECT id, subject, recipient, sent_at FROM tracks
+         WHERE owner_id=? AND id!=? AND sent=1
+         ORDER BY sent_at DESC, created_at DESC LIMIT 25`,
+        ownerId, excludeId);
+  for (const r of rows) {
+    if (normThreadSubject(r.subject) === ns && normPrimaryAddress(r.recipient) === nr) return r.id;
+  }
+  return null;
+}
+
 // Send-time commit: marks sent=1 with final metadata. Idempotent — committing
 // twice (Send click + Sent-list fallback) still yields exactly one track.
 async function commitTrack(id, ownerId, { subject, recipient, sender } = {}) {
@@ -548,7 +619,30 @@ async function commitTrack(id, ownerId, { subject, recipient, sender } = {}) {
   } else {
     liteRun(`UPDATE tracks SET ${sets.join(', ')} WHERE id=? AND owner_id=?`, ...vals);
   }
-  return { ok: true, alreadyCommitted: Number(existing.sent) === 1 };
+  // v2.4.0: follow-up chain. Always report the current parent link; search
+  // for a parent only on first commit. Never overwrites an existing link;
+  // failures never break the commit.
+  let parentId = null;
+  try {
+    const row = usePostgres
+      ? (await pgQuery('SELECT subject, recipient, parent_track_id FROM tracks WHERE id=$1', [id])).rows[0]
+      : liteGet('SELECT subject, recipient, parent_track_id FROM tracks WHERE id=?', id);
+    if (row && row.parent_track_id) {
+      parentId = row.parent_track_id;
+    } else if (row && Number(existing.sent) !== 1) {
+      parentId = await findParentTrack(ownerId, id, row.subject, row.recipient);
+      if (parentId) {
+        if (usePostgres) {
+          await pgQuery('UPDATE tracks SET parent_track_id=$1, updated_at=$2 WHERE id=$3', [parentId, at, id]);
+        } else {
+          liteRun('UPDATE tracks SET parent_track_id=?, updated_at=? WHERE id=?', parentId, at, id);
+        }
+      }
+    }
+  } catch (e) {
+    log.warn('[db] parent link failed', { error: e.message });
+  }
+  return { ok: true, alreadyCommitted: Number(existing.sent) === 1, parentTrackId: parentId };
 }
 
 async function updateTrack(id, ownerId, { subject, recipient, sender, sent }) {
@@ -731,13 +825,13 @@ async function getTrack(trackId, ownerId, opts = {}) {
   let t;
   if (usePostgres) {
     const r = await pgQuery(
-      'SELECT id, subject, recipient, sender, sent, created_at, sent_at, updated_at FROM tracks WHERE id=$1 AND owner_id=$2',
+      'SELECT id, subject, recipient, sender, parent_track_id, sent, created_at, sent_at, updated_at FROM tracks WHERE id=$1 AND owner_id=$2',
       [trackId, ownerId]);
     if (!r.rowCount) return null;
     t = r.rows[0];
   } else {
     t = liteGet(
-      'SELECT id, subject, recipient, sender, sent, created_at, sent_at, updated_at FROM tracks WHERE id=? AND owner_id=?',
+      'SELECT id, subject, recipient, sender, parent_track_id, sent, created_at, sent_at, updated_at FROM tracks WHERE id=? AND owner_id=?',
       trackId, ownerId);
     if (!t) return null;
   }
@@ -760,6 +854,8 @@ async function getTrack(trackId, ownerId, opts = {}) {
     id: t.id,
     subject: t.subject,
     recipient: t.recipient || '',
+    primary_recipient: primaryRecipient(t.recipient, t.sender),
+    parent_track_id: t.parent_track_id || null,
     sender: t.sender || '',
     sent: Number(t.sent) === 1,
     created_at: normTs(t.created_at),
@@ -806,7 +902,7 @@ async function listTracks(ownerId, limitOrOpts = 50, includeUnsent = false) {
   params.push(limit);
   const ownerPh = usePostgres ? '$1' : '?';
   const limitPh = usePostgres ? `$${params.length}` : '?';
-  const sql = `SELECT t.id, t.subject, t.recipient, t.sender, t.sent, t.created_at, t.sent_at, t.updated_at,
+  const sql = `SELECT t.id, t.subject, t.recipient, t.sender, t.parent_track_id, t.sent, t.created_at, t.sent_at, t.updated_at,
       ${agg.raw} AS raw_events, ${agg.unique} AS unique_events,
       ${agg.proxy} AS proxy_events, ${agg.direct} AS direct_events,
       ${agg.other} AS other_events, ${agg.unknown} AS unknown_events,
@@ -819,6 +915,8 @@ async function listTracks(ownerId, limitOrOpts = 50, includeUnsent = false) {
     id: x.id,
     subject: x.subject,
     recipient: x.recipient || '',
+    primary_recipient: primaryRecipient(x.recipient, x.sender),
+    parent_track_id: x.parent_track_id || null,
     sender: x.sender || '',
     sent: Number(x.sent) === 1,
     created_at: normTs(x.created_at),
@@ -844,7 +942,7 @@ async function reportSummary(ownerId, fromISO, toISO) {
   const where = usePostgres
     ? 'WHERE t.owner_id=$1 AND t.sent_at >= $2::timestamptz AND t.sent_at < $3::timestamptz AND t.sent=1'
     : 'WHERE t.owner_id=? AND t.sent_at >= ? AND t.sent_at < ? AND t.sent=1';
-  const sql = `SELECT t.id, t.subject, t.recipient, t.sender, t.sent_at,
+  const sql = `SELECT t.id, t.subject, t.recipient, t.sender, t.parent_track_id, t.sent_at,
       ${a.raw} AS raw_events, ${a.unique} AS unique_events,
       ${a.proxy} AS proxy_events, ${a.direct} AS direct_events,
       ${a.other} AS other_events, ${a.unknown} AS unknown_events,
@@ -858,6 +956,8 @@ async function reportSummary(ownerId, fromISO, toISO) {
     track_id: x.id,
     subject: x.subject,
     recipient: x.recipient || '',
+    primary_recipient: primaryRecipient(x.recipient, x.sender),
+    parent_track_id: x.parent_track_id || null,
     sender: x.sender || '',
     sent_at: normTs(x.sent_at),
     raw_events: Number(x.raw_events || 0),
@@ -894,5 +994,8 @@ module.exports = {
   getTrack,
   listTracks,
   reportSummary,
+  normThreadSubject,
+  primaryRecipient,
+  findParentTrack,
   backend: () => (usePostgres ? 'postgres' : 'sqlite'),
 };

@@ -39,7 +39,7 @@ const v = require('./validate');
 const { createRateLimiter } = require('./ratelimit');
 const log = require('./logger');
 
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 
 const app = express();
 app.set('trust proxy', true); // honor X-Forwarded-For on Render/Railway/etc.
@@ -254,7 +254,7 @@ app.post('/api/tracks/:id/commit', requireAuth, async (req, res) => {
       sender: v.str(body.from, 200),
     });
     if (!r.ok) return res.status(r.reason === 'not_found' ? 404 : 409).json({ error: r.reason || 'commit failed' });
-    res.json({ ok: true, alreadyCommitted: !!r.alreadyCommitted });
+    res.json({ ok: true, alreadyCommitted: !!r.alreadyCommitted, parentTrackId: r.parentTrackId || null });
   } catch (e) {
     log.error('commit failed', { error: e.message });
     res.status(500).json({ error: 'could not commit track' });
