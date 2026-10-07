@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: promail-tracker
+    runtime: node
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: GOOGLE_CLIENT_ID
+        value: 856594320148-mgk87mets58sfpfmpep76bdcnfeb40gr.apps.googleusercontent.com
+      # Optional: contact email shown on the /privacy page.
+      # - key: PRIVACY_CONTACT_EMAIL
+      #   value: you@example.com
+      # Optional: Google Search Console HTML-tag verification token (for OAuth
+      # authorized-domain verification). Rendered into /privacy as a meta tag.
+      # - key: GOOGLE_SITE_VERIFICATION
+      #   value: PASTE_TOKEN_HERE
