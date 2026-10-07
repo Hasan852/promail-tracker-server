@@ -1,0 +1,59 @@
+{
+  "action": {
+    "default_icon": {
+      "128": "icons/icon128.png",
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    },
+    "default_popup": "popup.html",
+    "default_title": "ProMail Tracker"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "content.js"
+      ],
+      "matches": [
+        "https://mail.google.com/*"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "description": "Private, real-time email tracking for Gmail with open history, Gmail proxy detection and secure per-install data isolation.",
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "https://promail-tracker-server.onrender.com/*"
+  ],
+  "icons": {
+    "128": "icons/icon128.png",
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png"
+  },
+  "manifest_version": 3,
+  "name": "ProMail Tracker",
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "options_page": "options.html",
+  "permissions": [
+    "storage",
+    "alarms",
+    "notifications",
+    "scripting",
+    "tabs",
+    "identity"
+  ],
+  "version": "2.3.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7LS6zIapgUEsUV1GcIh8mh5hLxZylHGZ+gJLmHY7S4Ssnakt9Khfmb4x8sXCzZ6QFbllwJxWiWDm6GmWXoHvnuSfRvL9UlVXSdEl9kuxz+wQZFiTIFHe74KofZO/ZSEVDtpFo+0OxpOucrxWx776fQps/M988xZ5fvVeqnXYcyoiVOYwiVWQtjrEc8VuR4T/U1ifLRx8ZKD+w5dPoFi9BiHdYtk6LVVKO9cnqo+ZWdqEFaoksiJeEfxVOcrRywJuprwcCCtKmhPRdDC3w7offg0BNP7lIP6VRP5cBxDYfTQNizTw/EJGavK+KH6FNeICt6HaSPWyF4/0PtlFK/eE/QIDAQAB",
+  "oauth2": {
+    "client_id": "856594320148-mgk87mets58sfpfmpep76bdcnfeb40gr.apps.googleusercontent.com",
+    "scopes": [
+      "openid",
+      "email",
+      "profile"
+    ]
+  }
+}

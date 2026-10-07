@@ -1,0 +1,119 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ProMail Tracker — Settings</title>
+<style>
+  :root {
+    --nbg: #e0e5ec; --ndark: #a9aeb9; --nlight: #ffffff;
+    --ntx: #3d434e; --nmut: #7b8290;
+    --ngrn: #0b7a55; --ngrnbg: #d3e5da; --nred: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --nbg: #2f333c; --ndark: #22252d; --nlight: #414755;
+      --ntx: #dde1e9; --nmut: #9aa1af;
+      --ngrn: #3ecf8e; --ngrnbg: #26332d; --nred: #e57373;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+    background: var(--nbg); color: var(--ntx); margin: 0; padding: 32px 16px; }
+  .card { max-width: 560px; margin: 0 auto; background: var(--nbg); border-radius: 20px;
+    padding: 26px 28px; box-shadow: 8px 8px 16px var(--ndark), -8px -8px 16px var(--nlight); }
+  h1 { font-size: 20px; margin: 0 0 18px; display: flex; align-items: center; gap: 10px; }
+  .ico { width: 36px; height: 36px; border-radius: 12px; flex-shrink: 0;
+    background: var(--nbg); box-shadow: inset 3px 3px 6px var(--ndark), inset -3px -3px 6px var(--nlight);
+    display: inline-flex; align-items: center; justify-content: center; color: var(--ngrn);
+    font-size: 18px; }
+  label { font-weight: 600; font-size: 14px; }
+  input { width: 100%; padding: 12px 14px; font-size: 14px; font-family: inherit; color: var(--ntx);
+    margin: 8px 0 4px; border: none; outline: none; border-radius: 12px; background: var(--nbg);
+    box-shadow: inset 4px 4px 8px var(--ndark), inset -4px -4px 8px var(--nlight); }
+  input:focus { box-shadow: inset 4px 4px 8px var(--ndark), inset -4px -4px 8px var(--nlight), 0 0 0 2px var(--ngrn); }
+  .hint { font-size: 12px; color: var(--nmut); margin-bottom: 16px; }
+  .row { display: flex; gap: 10px; margin-top: 8px; }
+  button { padding: 11px 20px; border: none; cursor: pointer; font-family: inherit;
+    font-size: 14px; font-weight: 600; color: var(--ntx);
+    background: var(--nbg); border-radius: 12px;
+    box-shadow: 4px 4px 8px var(--ndark), -4px -4px 8px var(--nlight); }
+  button:active { box-shadow: inset 4px 4px 8px var(--ndark), inset -4px -4px 8px var(--nlight); }
+  button.primary { background: var(--ngrnbg); color: var(--ngrn); }
+  #msg { margin-top: 14px; font-size: 14px; min-height: 20px; }
+  #pmsg { margin-top: 14px; font-size: 14px; min-height: 20px; }
+  #gmsg { margin-top: 14px; font-size: 14px; min-height: 20px; }
+  .ok { color: var(--ngrn); } .err { color: var(--nred); }
+  label.check { display: flex; align-items: center; font-weight: 600; font-size: 14px; margin-top: 14px; }
+  h2 { font-size: 16px; margin: 28px 0 10px; }
+  ol { font-size: 14px; line-height: 1.7; color: var(--ntx); padding-left: 22px; margin: 0; }
+  code { background: var(--nbg); box-shadow: inset 2px 2px 4px var(--ndark), inset -2px -2px 4px var(--nlight);
+    padding: 2px 8px; border-radius: 6px; font-size: 13px; }
+  p.hint { margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1><span class="ico">&#9881;</span> ProMail Tracker — Settings</h1>
+
+  <label for="url">Tracker server URL</label>
+  <input id="url" type="url" placeholder="https://your-tracker.onrender.com" spellcheck="false">
+  <div class="hint">Must start with <code>https://</code> (spam filters distrust http pixels). No trailing slash needed.</div>
+  <div class="row">
+    <button id="save" class="primary">Save</button>
+    <button id="test">Test connection</button>
+  </div>
+  <div id="msg"></div>
+
+  <h2>How it stays out of spam</h2>
+  <ol>
+    <li>Only <b>one 1×1 image</b> is added to each email — nothing else in your message is changed.</li>
+    <li>The pixel URL is <b>clean HTTPS</b> with no query strings, redirects, or cookies.</li>
+    <li>No hidden <code>display:none</code> tricks — just a plain tiny image, the most filter-friendly form.</li>
+    <li>If the server is down, your email is sent <b>completely untouched</b>.</li>
+  </ol>
+  <p class="hint">Note: the pixel itself is spam-neutral. Inbox placement still depends on your sending domain's reputation (SPF/DKIM/DMARC), subject lines, and sending volume — keep those healthy as usual.</p>
+</div>
+
+<div class="card" style="margin-top:18px">
+  <h1><span class="ico">👤</span> Google account</h1>
+  <p class="hint">Sign in with Google to protect your tracking data: the link lets you restore everything —
+  tracks, detections and reports — after reinstalling the extension or moving to another computer.</p>
+  <div id="gstatus" class="hint">Checking sign-in status…</div>
+  <div class="row">
+    <button id="gsignin" class="primary">Sign in with Google</button>
+    <button id="gsignout">Sign out</button>
+  </div>
+  <div id="gmsg"></div>
+  <p class="hint">The extension only uses your Google <b>identity</b> (account ID + email) — it never reads your Gmail.
+  Sign-out only clears this browser's session; your data stays linked to your Google account so a future sign-in restores it.</p>
+</div>
+
+<div class="card" style="margin-top:18px">
+  <h1><span class="ico">🔔</span> Tracking preferences</h1>
+
+  <label for="tz">Timezone (reports &amp; times)</label>
+  <input id="tz" list="zones" spellcheck="false" placeholder="Asia/Dhaka">
+  <datalist id="zones"></datalist>
+  <div class="hint">Used to display report dates and detection times. Timestamps are always stored in UTC.</div>
+
+  <label class="check"><input type="checkbox" id="notif" style="width:auto;margin-right:8px"> Desktop notifications for new detections</label>
+  <div class="hint">Notifications fire only for new <i>unique</i> detections — duplicate image loads never notify twice.</div>
+
+  <label class="check"><input type="checkbox" id="privacy" style="width:auto;margin-right:8px"> Privacy mode (don't store pixel IP addresses)</label>
+  <div class="hint">When on, the server skips storing IP addresses from tracking-pixel requests for your account. Detection still works; per-network analytics become less precise.</div>
+
+  <label for="cache">Local cache size (tracked emails kept in this popup)</label>
+  <input id="cache" type="number" min="50" max="5000" step="50" value="500">
+  <div class="hint">The server always keeps your full history — this only limits how many emails this browser profile caches locally.</div>
+
+  <div class="row">
+    <button id="psave" class="primary">Save preferences</button>
+  </div>
+  <div id="pmsg"></div>
+
+  <h2>What “detected” means</h2>
+  <p class="hint">Email tracking detects <b>image loading</b> — via Gmail's image proxy or directly. It <b>cannot guarantee</b> that a person read the message. “Estimated unique” is a conservative deduplicated count; the raw event count is kept for transparency.</p>
+</div>
+<script src="options.js"></script>
+</body>
+</html>
