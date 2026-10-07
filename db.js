@@ -551,7 +551,8 @@ function normPrimaryAddress(r) {
 }
 
 // Local part looks automated (mailing-list / no-reply style address).
-const AUTOMATED_LOCAL_RE = /^(no[-.]?reply|donotreply|do[-.]?not[-.]?reply|mailer[-.]?daemon|postmaster|bounces?|bounce[-.]?back)$/i;
+// Prefix match: "noreply-accounts", "donotreply-team" etc. are automated too.
+const AUTOMATED_LOCAL_RE = /^(no[-.]?reply|donotreply|do[-.]?not[-.]?reply|mailer[-.]?daemon|postmaster|bounces?|bounce[-.]?back)/i;
 
 // Display recipient: the first real human address. Automated addresses
 // (noreply@, mailer-daemon@, ...) are skipped; the sender's own address is

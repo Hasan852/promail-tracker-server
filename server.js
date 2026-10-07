@@ -39,7 +39,7 @@ const v = require('./validate');
 const { createRateLimiter } = require('./ratelimit');
 const log = require('./logger');
 
-const VERSION = '2.4.0';
+const VERSION = '2.4.1';
 
 const app = express();
 app.set('trust proxy', true); // honor X-Forwarded-For on Render/Railway/etc.

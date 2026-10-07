@@ -126,7 +126,7 @@ describe('database + API', () => {
     const r = await fetch(BASE + '/health');
     const j = await r.json();
     assert.equal(j.ok, true);
-    assert.equal(j.version, '2.4.0');
+    assert.equal(j.version, '2.4.1');
   });
 
   test('auth: missing/invalid token -> 401', async () => {
@@ -426,6 +426,8 @@ describe('database + API', () => {
       assert.equal(primaryRecipient('noreply-accounts@google.com, noreply@mailer.ashna.ai', ''), 'noreply-accounts@google.com', 'fallback to first when all automated');
       assert.equal(primaryRecipient('me@z.com, bob@y.com', 'me@z.com'), 'bob@y.com', 'sender excluded');
       assert.equal(primaryRecipient('mailer-daemon@googlemail.com, carol@y.com', ''), 'carol@y.com');
+      assert.equal(primaryRecipient('noreply-accounts@google.com, noreply@mailer.ashna.ai, productivity-report@mailsuite.com', ''),
+        'productivity-report@mailsuite.com', 'prefixed noreply variants filtered');
       assert.equal(primaryRecipient('', ''), '');
       assert.equal(primaryRecipient('  ', 'me@z.com'), '');
     });
