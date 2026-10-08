@@ -126,7 +126,7 @@ describe('database + API', () => {
     const r = await fetch(BASE + '/health');
     const j = await r.json();
     assert.equal(j.ok, true);
-    assert.equal(j.version, '2.4.1');
+    assert.equal(j.version, '2.4.2');
   });
 
   test('auth: missing/invalid token -> 401', async () => {

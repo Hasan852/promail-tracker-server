@@ -1,4 +1,4 @@
-// server.js — ProMail Tracker backend (v2.3.0).
+// server.js — ProMail Tracker backend (v2.4.2).
 //
 // Endpoints:
 //   GET  /health                              -> { ok, backend, version, time, db }
@@ -39,7 +39,7 @@ const v = require('./validate');
 const { createRateLimiter } = require('./ratelimit');
 const log = require('./logger');
 
-const VERSION = '2.4.1';
+const VERSION = '2.4.2';
 
 const app = express();
 app.set('trust proxy', true); // honor X-Forwarded-For on Render/Railway/etc.
@@ -67,8 +67,17 @@ app.use((req, res, next) => {
 });
 
 // Rate limits: pixel endpoint per IP; APIs per token (or IP fallback).
-const pixelLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 240 });
+// Gmail's image proxy shares a handful of IPs across ALL Gmail users, so the
+// pixel limit is per (IP, track) with a generous per-IP ceiling as a DoS guard —
+// a busy sender can never lose real detections to someone else's traffic.
+const pixelIpLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 3000 });
+const pixelTrackLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 60 });
 const apiLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 180 });
+const apiIpLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 1200 });
+// Rotating fresh tokens used to dodge the per-token limit and fill the database
+// with accounts. Creating an account now has its own per-IP and global budget.
+const newAccountIpLimiter = createRateLimiter({ windowMs: 3600 * 1000, max: Number(process.env.NEW_ACCOUNTS_PER_IP_HOUR) || 30 });
+const newAccountGlobalLimiter = createRateLimiter({ windowMs: 3600 * 1000, max: Number(process.env.NEW_ACCOUNTS_GLOBAL_HOUR) || 300 });
 
 // 1x1 transparent GIF
 const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -89,10 +98,19 @@ function rateKey(req) {
 
 async function requireAuth(req, res, next) {
   try {
+    if (!apiIpLimiter.allow('ip:' + clientIp(req))) return res.status(429).json({ error: 'rate limited' });
     if (!apiLimiter.allow(rateKey(req))) return res.status(429).json({ error: 'rate limited' });
     const token = req.get('X-PMT-Key');
     if (!token || token.length < v.TOKEN_MIN_LEN) return res.status(401).json({ error: 'authentication required' });
-    req.ownerId = await db.ensureAccount(token);
+    let ownerId = await db.findAccount(token);
+    if (!ownerId) {
+      if (!newAccountIpLimiter.allow(clientIp(req)) || !newAccountGlobalLimiter.allow('global')) {
+        log.warn('account creation rate limited', { ip: clientIp(req) });
+        return res.status(429).json({ error: 'too many new accounts, try again later' });
+      }
+      ownerId = await db.ensureAccount(token);
+    }
+    req.ownerId = ownerId;
     next();
   } catch (e) {
     log.error('auth failed', { error: e.message });
@@ -329,6 +347,14 @@ app.get('/api/create-track', requireAuth, async (req, res) => {
       id, ownerId: req.ownerId,
     });
     if (!r.ok) return res.status(409).json({ error: r.reason || 'conflict' });
+    // Pre-2.2 extensions call create-track WITHOUT deferred=1 to mean "sent".
+    // It used to leave the track unsent (opens ignored forever); now it commits.
+    if (req.query.deferred !== '1') {
+      const c = await db.commitTrack(r.id, req.ownerId, {
+        subject: v.str(req.query.subject, 300), recipient: v.str(req.query.to, 300), sender: v.str(req.query.from, 200),
+      });
+      if (!c.ok) return res.status(409).json({ error: c.reason || 'conflict' });
+    }
     res.json({ trackId: r.id });
   } catch (e) {
     log.error('legacy create-track failed', { error: e.message });
@@ -381,16 +407,21 @@ app.get('/api/status/:id', requireAuth, async (req, res) => {
 // sensitive data in the URL. The pixel is ALWAYS served, even if analytics
 // logging fails or times out — a broken database must never hang Gmail.
 app.get('/px/:id.gif', async (req, res) => {
-  if (!pixelLimiter.allow(clientIp(req))) {
-    log.warn('pixel rate limited', { ip: clientIp(req) });
-  } else {
-    const ua = req.headers['user-agent'] || '';
-    const work = db.logDetectionEvent(req.params.id, { ip: clientIp(req), userAgent: ua });
-    const timeout = new Promise((resolve) => setTimeout(() => resolve({ stored: false, reason: 'timeout' }), 4000));
-    try {
-      await Promise.race([work, timeout]);
-    } catch (e) {
-      log.error('pixel logging failed', { error: e.message });
+  // HEAD requests (link checkers, scanners) are served the image but NEVER
+  // counted — Express routes HEAD to this GET handler.
+  if (req.method === 'GET') {
+    const ip = clientIp(req);
+    if (!pixelIpLimiter.allow(ip) || !pixelTrackLimiter.allow(ip + '|' + String(req.params.id).slice(0, 64))) {
+      log.warn('pixel rate limited', { ip });
+    } else {
+      const ua = req.headers['user-agent'] || '';
+      const work = db.logDetectionEvent(req.params.id, { ip, userAgent: ua });
+      const timeout = new Promise((resolve) => setTimeout(() => resolve({ stored: false, reason: 'timeout' }), 4000));
+      try {
+        await Promise.race([work, timeout]);
+      } catch (e) {
+        log.error('pixel logging failed', { error: e.message });
+      }
     }
   }
   res.setHeader('Content-Type', 'image/gif');
@@ -403,29 +434,79 @@ app.get('/px/:id.gif', async (req, res) => {
 
 // ---- Reports ----
 
-function currentWeekRangeUTC() {
-  const now = new Date();
-  const mondayOffset = (now.getUTCDay() + 6) % 7; // Monday = 0
-  const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - mondayOffset, 0, 0, 0));
-  const to = new Date(from.getTime() + 7 * 24 * 3600 * 1000);
-  return { from: from.toISOString(), to: to.toISOString(), label: from.toISOString().slice(0, 10) };
+// ---- timezone helpers (v2.4.2: default week/month follow the user's zone) ----
+
+function tzOffsetMs(zone, ts) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const p = dtf.formatToParts(new Date(ts)).reduce((a, x) => (a[x.type] = x.value, a), {});
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - ts;
 }
 
-function currentMonthRangeUTC() {
-  const now = new Date();
-  const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0));
-  const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0));
-  return { from: from.toISOString(), to: to.toISOString(), label: from.toISOString().slice(0, 7) };
+// Local wall-clock midnight of y-m-d in `zone` -> UTC epoch ms (two-pass: DST safe).
+function zonedMidnightUTC(y, m, d, zone) {
+  const guess = Date.UTC(y, m - 1, d);
+  const o1 = tzOffsetMs(zone, guess);
+  const o2 = tzOffsetMs(zone, guess - o1);
+  return guess - o2;
+}
+
+function localYMD(ms, zone) {
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(ms)).reduce((a, x) => (a[x.type] = x.value, a), {});
+  return { y: +p.year, m: +p.month, d: +p.day };
+}
+
+function defaultZone(tz) {
+  return v.timezone(tz) || v.timezone(process.env.REPORT_TZ) || 'UTC';
+}
+
+function currentWeekRange(zone, nowMs = Date.now()) {
+  const { y, m, d } = localYMD(nowMs, zone);
+  const mondayOffset = (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+  const mon = new Date(Date.UTC(y, m - 1, d - mondayOffset));
+  const next = new Date(Date.UTC(y, m - 1, d - mondayOffset + 7));
+  return {
+    from: new Date(zonedMidnightUTC(mon.getUTCFullYear(), mon.getUTCMonth() + 1, mon.getUTCDate(), zone)).toISOString(),
+    to: new Date(zonedMidnightUTC(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), zone)).toISOString(),
+    label: mon.toISOString().slice(0, 10),
+  };
+}
+
+function currentMonthRange(zone, nowMs = Date.now()) {
+  const { y, m } = localYMD(nowMs, zone);
+  const next = new Date(Date.UTC(y, m, 1));
+  return {
+    from: new Date(zonedMidnightUTC(y, m, 1, zone)).toISOString(),
+    to: new Date(zonedMidnightUTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 1, zone)).toISOString(),
+    label: `${y}-${String(m).padStart(2, '0')}`,
+  };
+}
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Date-only bounds (YYYY-MM-DD) mean local midnight in the report timezone;
+// full ISO timestamps are taken as given.
+function parseBound(raw, zone) {
+  if (typeof raw === 'string' && DATE_ONLY_RE.test(raw)) {
+    const [y, m, d] = raw.split('-').map(Number);
+    if (Number.isNaN(Date.parse(raw + 'T00:00:00Z'))) return null;
+    return new Date(zonedMidnightUTC(y, m, d, zone)).toISOString();
+  }
+  return v.isoDateTime(raw);
 }
 
 function parseRange(q, kind) {
+  const zone = defaultZone(q.tz);
   if (q.from && q.to) {
-    const from = v.isoDateTime(q.from);
-    const to = v.isoDateTime(q.to);
+    const from = parseBound(String(q.from), zone);
+    const to = parseBound(String(q.to), zone);
     if (!from || !to || to <= from) return null;
     return { from, to, label: `${String(q.from).slice(0, 10)}_to_${String(q.to).slice(0, 10)}` };
   }
-  return kind === 'month' ? currentMonthRangeUTC() : currentWeekRangeUTC();
+  return kind === 'month' ? currentMonthRange(zone) : currentWeekRange(zone);
 }
 
 function summarize(rows) {
@@ -486,7 +567,8 @@ async function reportPayload(ownerId, range, tz) {
 }
 
 function escCSV(val) {
-  const s = String(val == null ? '' : val);
+  let s = String(val == null ? '' : val);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // neutralise spreadsheet formula injection
   return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
@@ -613,6 +695,7 @@ app.get('/api/report', requireAuth, (req, res) => serveReportApi(req, res, 'week
 app.use((req, res) => res.status(404).json({ error: 'not found' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
+  if (err && err.status >= 400 && err.status < 500) return res.status(err.status).json({ error: 'bad request' });
   log.error('unhandled request error', { error: err && err.message });
   res.status(500).json({ error: 'internal error' });
 });
@@ -635,4 +718,4 @@ db.init()
     process.exit(1);
   });
 
-module.exports = { app, VERSION, close: () => { try { if (listener) listener.close(); } catch (e) { /* ignore */ } } };
+module.exports = { app, VERSION, currentWeekRange, currentMonthRange, zonedMidnightUTC, close: () => { try { if (listener) listener.close(); } catch (e) { /* ignore */ } } };

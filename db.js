@@ -1,4 +1,4 @@
-// ProMail Tracker storage layer — v2.3.0
+// ProMail Tracker storage layer — v2.4.2
 //
 // Postgres is recommended for hosted deployments; node:sqlite is supported
 // for local/VPS use.
@@ -14,11 +14,12 @@
 //     first/last detected timestamps
 //
 // SELF-VIEW MODEL (v2.2.0): sender signals are recorded, then proxy-type
-// events inside [signal-180s, signal+120s] are FLAGGED
-// (is_suspected_self_view) — never deleted. Flagged events are excluded from
-// analytics but remain visible in diagnostics. Limitation: a recipient proxy
-// event inside the same window can be mis-flagged; this is documented, not
-// hidden.
+// events inside [signal-20s, signal+30s] are FLAGGED
+// (is_suspected_self_view) — never deleted. A hit that arrives AFTER the
+// signal is flagged at insert time; a hit that arrived BEFORE it is flagged by
+// the signal itself. Flagged events are excluded from analytics but remain
+// visible in diagnostics. Limitation: a recipient proxy event inside the same
+// ~50s window can be mis-flagged; this is documented, not hidden.
 //
 // GOOGLE IDENTITY MODEL (v2.3.0):
 //   accounts.google_sub  = Google's stable user id ("sub"), UNIQUE, nullable.
@@ -43,8 +44,12 @@ let sqliteDb = null;
 let pgPool = null;
 
 const LEGACY_OWNER = 'legacy';
-const SELF_VIEW_BACK_SEC = 180;
-const SELF_VIEW_FWD_SEC = 120;
+// Self-view windows (v2.4.2). The extension signals the moment the sender's own
+// copy of the pixel shows up in Gmail, so the proxy hit lands within seconds of
+// the signal — either just before it (BACK) or just after it (FWD). The old
+// 180s/120s windows hid real recipient opens; these are deliberately tight.
+const SELF_VIEW_BACK_SEC = 20;
+const SELF_VIEW_FWD_SEC = 30;
 
 const SQLITE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS accounts (
@@ -344,6 +349,18 @@ async function ensureAccount(token) {
   }
 }
 
+// Lookup only — never creates. Lets the API rate-limit account creation.
+async function findAccount(token) {
+  if (!token || String(token).length < 36) return null;
+  const hash = hashToken(token);
+  if (usePostgres) {
+    const r = await pgQuery('SELECT id FROM accounts WHERE token_hash = $1', [hash]);
+    return r.rowCount ? r.rows[0].id : null;
+  }
+  const row = liteGet('SELECT id FROM accounts WHERE token_hash = ?', hash);
+  return row ? row.id : null;
+}
+
 async function getPrivacyMode(ownerId) {
   if (usePostgres) {
     const r = await pgQuery('SELECT privacy_mode FROM accounts WHERE id=$1', [ownerId]);
@@ -495,7 +512,12 @@ async function createTrack(subject, recipient, sender, opts = {}) {
       log.warn('[db] createTrack owner mismatch', { id });
       return { id, ok: false, reason: 'owner_mismatch' };
     }
-    await updateTrack(id, ownerId, { subject: subj, recipient: r, sender: s });
+    // A late/duplicate create (outbox retry) must never overwrite the final
+    // metadata of a mail that was already sent, nor blank good values.
+    if (Number(existing.sent) === 1) return { id, ok: true, deduped: true };
+    await updateTrack(id, ownerId, {
+      subject: subj || undefined, recipient: r || undefined, sender: s || undefined,
+    });
     return { id, ok: true, deduped: true };
   }
   try {
@@ -598,8 +620,29 @@ async function findParentTrack(ownerId, excludeId, subject, recipient) {
 // Send-time commit: marks sent=1 with final metadata. Idempotent — committing
 // twice (Send click + Sent-list fallback) still yields exactly one track.
 async function commitTrack(id, ownerId, { subject, recipient, sender } = {}) {
-  const existing = await getTrackOwner(id);
-  if (!existing) return { ok: false, reason: 'not_found' };
+  let existing = await getTrackOwner(id);
+  let created = false;
+  if (!existing) {
+    // v2.4.2: the commit carries the final metadata, so a track the server has
+    // never seen (compose-time create failed / server was asleep) is created
+    // right here instead of being rejected. Previously the extension then fell
+    // back to a legacy call that made an UNSENT track and the mail was never tracked.
+    const at0 = nowISO();
+    try {
+      if (usePostgres) {
+        await pgQuery(
+          'INSERT INTO tracks (id, owner_id, subject, recipient, sender, sent, created_at, updated_at, schema_version) VALUES ($1,$2,$3,$4,$5,0,$6,$6,2)',
+          [id, ownerId, '', '', '', at0]);
+      } else {
+        liteRun(
+          'INSERT INTO tracks (id, owner_id, subject, recipient, sender, sent, created_at, updated_at, schema_version) VALUES (?,?,?,?,?,0,?,?,2)',
+          id, ownerId, '', '', '', at0, at0);
+      }
+      created = true;
+    } catch (e) { /* lost a race with a concurrent create: re-read below */ }
+    existing = await getTrackOwner(id);
+    if (!existing) return { ok: false, reason: 'not_found' };
+  }
   if (existing.owner_id !== ownerId) {
     log.warn('[db] commitTrack owner mismatch', { id });
     return { ok: false, reason: 'owner_mismatch' };
@@ -643,7 +686,7 @@ async function commitTrack(id, ownerId, { subject, recipient, sender } = {}) {
   } catch (e) {
     log.warn('[db] parent link failed', { error: e.message });
   }
-  return { ok: true, alreadyCommitted: Number(existing.sent) === 1, parentTrackId: parentId };
+  return { ok: true, alreadyCommitted: Number(existing.sent) === 1, created, parentTrackId: parentId };
 }
 
 async function updateTrack(id, ownerId, { subject, recipient, sender, sent }) {
@@ -666,6 +709,15 @@ async function updateTrack(id, ownerId, { subject, recipient, sender, sent }) {
 
 // ---------- detection events ----------
 
+async function hasRecentSelfViewSignal(pid, nowMs) {
+  const row = usePostgres
+    ? (await pgQuery('SELECT viewed_at FROM self_views WHERE track_id=$1', [pid])).rows[0]
+    : liteGet('SELECT viewed_at FROM self_views WHERE track_id=?', pid);
+  if (!row) return false;
+  const ms = Date.parse(normTs(row.viewed_at));
+  return Number.isFinite(ms) && ms <= nowMs + 2000 && nowMs - ms <= SELF_VIEW_FWD_SEC * 1000;
+}
+
 // Public pixel endpoint logic. NEVER throws; NEVER requires auth (email
 // clients cannot send X-PMT-Key). Unknown / unsent tracks are ignored without
 // leaking track existence.
@@ -684,20 +736,25 @@ async function logDetectionEvent(trackId, { ip, userAgent }) {
     const receivedAt = now.toISOString();
     const key = dedupeKey(pid, eventType, ua, cleanIp, now.getTime());
     const client = normalizedClient(eventType, ua, cleanIp);
+    // Sender already signalled "I'm looking at my own mail" a moment ago: this
+    // proxy hit is that same view. Stored (append-only) but flagged.
+    const flagged = (eventType === 'GMAIL_PROXY' || eventType === 'OTHER_PROXY')
+      ? await hasRecentSelfViewSignal(pid, now.getTime())
+      : false;
     if (usePostgres) {
       await pgQuery(
         `INSERT INTO events (track_id, received_at, ip, user_agent, device, event_type, normalized_client, dedupe_key, is_suspected_self_view)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)`,
-        [pid, receivedAt, cleanIp, ua, device, eventType, client, key]);
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [pid, receivedAt, cleanIp, ua, device, eventType, client, key, flagged]);
       await pgQuery('UPDATE tracks SET updated_at=$1 WHERE id=$2', [receivedAt, pid]);
     } else {
       liteRun(
         `INSERT INTO events (track_id, received_at, ip, user_agent, device, event_type, normalized_client, dedupe_key, is_suspected_self_view)
-         VALUES (?,?,?,?,?,?,?,?,0)`,
-        pid, receivedAt, cleanIp, ua, device, eventType, client, key);
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        pid, receivedAt, cleanIp, ua, device, eventType, client, key, flagged ? 1 : 0);
       liteRun('UPDATE tracks SET updated_at=? WHERE id=?', receivedAt, pid);
     }
-    return { stored: true, eventType, dedupeKey: key };
+    return { stored: true, eventType, dedupeKey: key, flagged };
   } catch (e) {
     log.error('[db] logDetectionEvent failed', { error: e.message });
     return { stored: false, reason: 'error' };
@@ -981,6 +1038,7 @@ async function reportSummary(ownerId, fromISO, toISO) {
 module.exports = {
   init,
   ensureAccount,
+  findAccount,
   getPrivacyMode,
   setPrivacyMode,
   getGoogleLink,
