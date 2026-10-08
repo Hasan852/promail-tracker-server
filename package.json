@@ -1,6 +1,6 @@
 {
   "name": "promail-tracker-server",
-  "version": "2.3.0",
+  "version": "2.4.2",
   "private": true,
   "description": "Backend for ProMail Tracker",
   "main": "server/server.js",
@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node server/server.js",
     "start:server": "node server/server.js",
-    "test": "node --test server/test.js extension/test.js"
+    "test": "node --test server/test.js server/test.fixes.js extension/test.js extension/test.integration.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
