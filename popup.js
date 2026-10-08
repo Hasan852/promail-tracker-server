@@ -20,6 +20,9 @@ function esc(s) {
 }
 
 function recipientOnly(track) {
+  // v2.4.0: server-computed primary recipient (automated noreply-style
+  // addresses filtered out); falls back to the old join for older data.
+  if (track.primary_recipient) return esc(track.primary_recipient);
   const sender = String(track.sender || '').trim().toLowerCase();
   const recipients = String(track.recipient || '').split(/[;,]/)
     .map((email) => email.trim())
@@ -62,7 +65,7 @@ function tickForTrack(t) {
 // but Send not yet clicked) carry sent:0 and stay hidden. Missing sent flag
 // (tracks stored by older versions) counts as sent.
 function shouldShowTrack(t) {
-  return t.sent !== 0;
+  return t.sent !== 0 && !t.hidden; // hidden = the user pressed "Clear list"
 }
 
 function detectionLine(t) {
@@ -95,15 +98,66 @@ function historyHtml(t) {
   return `<div class="history" hidden>${rows}${note}</div>`;
 }
 
+function parentIdOf(t) { return t.parent_track_id || t.parentTrackId || null; }
+
+// v2.4.0: follow-up chains. Tracks group under their root ancestor
+// (cycle-safe walk). Roots sort newest-first; chain members oldest-first.
+function buildChains(tracks) {
+  const byId = {};
+  for (const id of Object.keys(tracks)) {
+    if (shouldShowTrack(tracks[id])) byId[id] = tracks[id];
+  }
+  const rootCache = {};
+  function rootId(id) {
+    if (rootCache[id]) return rootCache[id];
+    let cur = id;
+    const seen = new Set([id]);
+    for (let g = 0; g < 20; g++) {
+      const t = byId[cur];
+      if (!t) break;
+      const p = parentIdOf(t);
+      if (!p || !byId[p] || seen.has(p)) break;
+      seen.add(p);
+      cur = p;
+    }
+    rootCache[id] = cur;
+    return cur;
+  }
+  const groups = {};
+  for (const id of Object.keys(byId)) {
+    const r = rootId(id);
+    (groups[r] = groups[r] || []).push(id);
+  }
+  const timeOf = (id) => String(byId[id].sentAt || byId[id].createdAt || '');
+  const roots = Object.keys(groups).sort((a, b) =>
+    String(byId[b].createdAt || '').localeCompare(String(byId[a].createdAt || '')));
+  for (const r of roots) groups[r].sort((a, b) => timeOf(a).localeCompare(timeOf(b)));
+  return { byId, roots, groups };
+}
+
+function itemHtml(t, serial, depth) {
+  const { tickCls, tickMark } = tickForTrack(t);
+  const toLine = recipientOnly(t);
+  const subjLine = esc(t.subject) ? `\u201c${esc(t.subject)}\u201d` : '<i>(no subject)</i>';
+  const detLine = detectionLine(t);
+  const tLine = timeLine(t);
+  const followTag = depth > 0 ? '<span class="followtag">follow-up</span>' : '';
+  return `<div class="item${depth ? ' child' : ''}"><div class="serial">${depth ? '\u21b3' : '#' + serial}</div><div class="body">
+    <div class="to"><span class="tick ${tickCls}" title="${esc(DISCLAIMER)}">${tickMark}</span>To: ${toLine}${followTag}</div>
+    <div class="subj">${subjLine}</div>
+    <div class="meta">${esc(detLine)}</div>
+    ${tLine ? `<div class="meta">${tLine}</div>` : ''}
+    ${historyHtml(t)}
+  </div></div>`;
+}
+
 async function load() {
   const d = await chrome.storage.local.get(['serverUrl', 'tracks', 'lastSyncAt', 'deadLetter']);
-  const serverUrl = (d.serverUrl || '').replace(/\/+$/, '');
+  const serverUrl = (d.serverUrl || PMT_DEFAULT_SERVER_URL).replace(/\/+$/, '');
   const tracks = d.tracks || {};
 
   const statusEl = document.getElementById('status');
-  if (!serverUrl) {
-    statusEl.textContent = '⚠ Set your server URL in Settings first.';
-  } else {
+  {
     try {
       const r = await fetch(serverUrl + '/health');
       const j = await r.json();
@@ -122,27 +176,17 @@ async function load() {
   syncEl.hidden = bits.length === 0;
 
   const list = document.getElementById('list');
-  const ids = Object.keys(tracks)
-    .filter((id) => shouldShowTrack(tracks[id]))
-    .sort((a, b) => (tracks[b].createdAt || '').localeCompare(tracks[a].createdAt || ''));
-  if (ids.length === 0) {
+  const { byId, roots, groups } = buildChains(tracks);
+  if (roots.length === 0) {
     list.innerHTML = '<div class="empty">No tracked emails yet.<br>Send an email in Gmail and it will appear here.</div>';
   } else {
-    list.innerHTML = ids.slice(0, 100).map((id, i) => {
-      const t = tracks[id];
-      const { tickCls, tickMark } = tickForTrack(t);
-      const toLine = recipientOnly(t);
-      const subjLine = esc(t.subject) ? `“${esc(t.subject)}”` : '<i>(no subject)</i>';
-      const detLine = detectionLine(t);
-      const tLine = timeLine(t);
-      return `<div class="item"><div class="serial">#${i + 1}</div><div class="body">
-        <div class="to"><span class="tick ${tickCls}" title="${esc(DISCLAIMER)}">${tickMark}</span>To: ${toLine}</div>
-        <div class="subj">${subjLine}</div>
-        <div class="meta">${esc(detLine)}</div>
-        ${tLine ? `<div class="meta">${tLine}</div>` : ''}
-        ${historyHtml(t)}
-      </div></div>`;
-    }).join('');
+    const parts = [];
+    roots.slice(0, 100).forEach((rid, i) => {
+      groups[rid].forEach((id, di) => {
+        parts.push(itemHtml(byId[id], i + 1, di));
+      });
+    });
+    list.innerHTML = parts.join('');
   }
 
   // Opening the popup marks notifications as seen.
@@ -155,11 +199,13 @@ document.getElementById('refresh').addEventListener('click', async () => {
   load();
 });
 
-// Clear: wipes only THIS profile's local cache. Server history stays safe.
+// Clear list: only HIDES the rows here. Wiping the cache would also remove the
+// Gmail ticks and (because sync is incremental) never bring those mails back.
+// Server history is untouched; a hidden mail reappears when it is detected again.
 document.getElementById('clear').addEventListener('click', async () => {
-  if (!confirm('Clear this popup\u2019s local cache?\nYour server history stays safe.')) return;
-  await chrome.storage.local.set({ tracks: {}, unread: 0, deadLetter: [] });
-  await chrome.runtime.sendMessage({ type: 'PMT_CLEAR_BADGE' });
+  if (!confirm('Clear this list?\nGmail ticks, notifications and your server history are not affected.')) return;
+  await chrome.storage.local.set({ deadLetter: [] });
+  await chrome.runtime.sendMessage({ type: 'PMT_CLEAR_LIST' });
   load();
 });
 
@@ -172,9 +218,6 @@ document.getElementById('list').addEventListener('click', (e) => {
 });
 
 async function openReport(kind) {
-  const d = await chrome.storage.local.get(['serverUrl']);
-  const serverUrl = (d.serverUrl || '').replace(/\/+$/, '');
-  if (!serverUrl) return alert('Set your server URL in Settings first.');
   chrome.tabs.create({ url: chrome.runtime.getURL('report.html?kind=' + encodeURIComponent(kind)) });
 }
 

@@ -53,6 +53,9 @@
   .item .meta b { color: var(--ngrn); }
   .item .from { font-size: 11px; color: var(--nmut); margin-top: 2px; }
   .item { cursor: pointer; }
+  .item.child { margin-left: 26px; }
+  .followtag { font-size: 10px; font-weight: 600; color: var(--ngrn); background: var(--ngrnbg);
+    border-radius: 999px; padding: 1px 8px; margin-left: 6px; vertical-align: 1px; }
   .history { margin-top: 8px; border-radius: 12px; padding: 8px 12px; background: var(--nbg);
     box-shadow: inset 3px 3px 6px var(--ndark), inset -3px -3px 6px var(--nlight); }
   .hrow { font-size: 11px; color: var(--nmut); padding: 3px 0; }
@@ -76,19 +79,20 @@
 <div class="wrap">
   <header>
     <div class="ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/></svg></div>
-    <div><h1>ProMail Tracker</h1><p>v2.3.0 &middot; soft UI &middot; <span title="Email tracking detects image loading. It cannot guarantee that a person read the message.">ⓘ detection = image loads</span></p></div>
+    <div><h1>ProMail Tracker</h1><p>v2.4.1 &middot; soft UI &middot; <span title="Email tracking detects image loading. It cannot guarantee that a person read the message.">ⓘ detection = image loads</span></p></div>
   </header>
   <div id="status">checking&hellip;</div>
   <div id="syncinfo" hidden></div>
   <div id="list"></div>
   <footer>
     <button id="refresh">&#8635; Refresh</button>
-    <button id="clear">&#128465; Clear</button>
+    <button id="clear">&#128465; Clear list</button>
     <button id="weekly" class="primary">Weekly</button>
     <button id="monthly" class="primary">Monthly</button>
     <button id="settings">&#9881; Settings</button>
   </footer>
 </div>
+<script src="config.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>

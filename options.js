@@ -10,7 +10,7 @@
 // Pre-configured server (same as background.js DEFAULT_SERVER_URL) — shown
 // in the box by default so every profile works with zero setup. Saving a
 // different URL here overrides it.
-const DEFAULT_SERVER_URL = 'https://promail-tracker-server.onrender.com';
+const DEFAULT_SERVER_URL = PMT_DEFAULT_SERVER_URL; // from config.js
 
 const msg = (t, cls) => {
   const el = document.getElementById('msg');
@@ -60,16 +60,20 @@ document.getElementById('save').addEventListener('click', async () => {
     msg('❌ URL must start with https://', 'err');
     return;
   }
-  msg('Testing connection…');
+  // Ask for the permission FIRST: Chrome only allows this call while the click's
+  // user-gesture is still fresh, and a sleeping server can take 30s+ to answer.
+  let granted = false;
+  try {
+    granted = await chrome.permissions.request({ origins: [url + '/*'] });
+  } catch (e) { granted = false; }
+  if (!granted) {
+    msg('⚠ Permission denied — the tracker cannot poll this server.', 'err');
+    return;
+  }
+  msg('Testing connection… (a sleeping server can take up to a minute)');
   try {
     const info = await testUrl(url);
     await bootstrap(url);
-    // Ask Chrome for permission to talk to this origin.
-    const granted = await chrome.permissions.request({ origins: [url + '/*'] });
-    if (!granted) {
-      msg('⚠ Permission denied — the tracker cannot poll this server.', 'err');
-      return;
-    }
     await chrome.storage.local.set({ serverUrl: url });
     msg(`✅ Saved & connected (backend: ${info.backend}). You can close this tab.`, 'ok');
   } catch (e) {
@@ -136,26 +140,25 @@ document.getElementById('psave').addEventListener('click', async () => {
   const privacy = document.getElementById('privacy').checked;
   const cache = Math.min(Math.max(parseInt(document.getElementById('cache').value, 10) || 500, 50), 5000);
   const prev = await chrome.storage.local.get(['privacyMode', 'serverUrl']);
-  await chrome.storage.local.set({
-    timezone: tz,
-    notificationsEnabled: notif,
-    privacyMode: privacy,
-    maxTracks: cache,
-  });
-  // Push privacy mode to the server account (pixel IPs stop being stored).
-  if (!!prev.privacyMode !== privacy && prev.serverUrl) {
+  await chrome.storage.local.set({ timezone: tz, notificationsEnabled: notif, maxTracks: cache });
+  // Privacy mode is stored locally ONLY after the server accepted it, so the
+  // checkbox can never say "on" while the server still records pixel IPs.
+  // (The old code skipped the server call entirely when no URL had been saved.)
+  if (!!prev.privacyMode !== privacy) {
     pmsg('Saving privacy mode on the server…');
     try {
       const token = await getAuthToken();
-      const url = String(prev.serverUrl).replace(/\/+$/, '');
+      const url = String(prev.serverUrl || DEFAULT_SERVER_URL).replace(/\/+$/, '');
       const res = await fetch(url + '/api/account/preferences', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-PMT-Key': token },
         body: JSON.stringify({ privacy_mode: privacy ? 1 : 0 }),
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
+      await chrome.storage.local.set({ privacyMode: privacy });
     } catch (e) {
-      pmsg('⚠ Preferences saved locally, but the server update failed: ' + e.message, 'err');
+      document.getElementById('privacy').checked = !!prev.privacyMode;
+      pmsg('⚠ Other preferences saved, but privacy mode was NOT changed (server update failed: ' + e.message + ').', 'err');
       return;
     }
   }

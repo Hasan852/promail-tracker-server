@@ -1,163 +1,152 @@
-// v1.7.0: re-injection guard — background.js re-injects this file into open
-// Gmail tabs after install/startup (no more F5 needed). The guard makes
-// re-execution safe: top-level const/let live inside this block scope.
+// content.js — runs inside Gmail (v2.4.2).
+//
+// Part 1  pixel insertion   one 1x1 <img>, nothing else in the mail is touched.
+// Part 2  send detection    delegated listeners (survive Gmail re-rendering) -> server commit.
+// Part 3  own-view guard    the sender's own copy of the pixel is removed the moment it
+//                           appears in Gmail's message view and the server is told, so the
+//                           sender reading their own mail is never counted or notified.
+// Part 4  ticks             ✓ sent / ✓✓ detected, in the Sent list and the message view.
+//
+// All Gmail-specific selectors live in SELECTORS below: if Google renames a
+// class, this is the only place to change.
+//
+// Re-injection guard: background.js re-injects this file into already-open Gmail
+// tabs after install/update; the guard makes re-execution safe.
 if (!window.__pmtBooted) {
 window.__pmtBooted = true;
-// content.js — runs inside Gmail.
-//
-// Part 1: injects the tracking pixel into compose windows.
-//   Spam-safety rules:
-//   - Exactly ONE <img> tag is added, nothing else in the email body is touched.
-//   - Minimal attributes: src + width/height 1 + border 0 + empty alt. No CSS,
-//     no display:none (hidden content can be less transparent to filters), no wrapper divs.
-//   - Pixel URL is clean HTTPS with no query strings or redirects.
-//   - If the server is unreachable or not configured, composing is untouched.
-//
-// Part 2: detection tick marks in Sent Mail (v2.2.0 terminology).
-//   - ✓  (single, gray) = sent, no detection yet
-//   - ✓✓ (double, green) = detection received (image loaded; see tooltip)
-//   Placed Mailsuite-style: LEFT, between the star and "To:".
-//   Ticks are a pure UI overlay in the browser DOM — the email body is never
-//   touched by them, so they cannot affect spam placement.
 
-/* ============ Centralized Gmail selector layer (v2.2.0) ============
- * Gmail changes its DOM without notice. EVERY Gmail selector lives in this
- * one object — no other code in this file may hard-code a Gmail class or
- * attribute. Entries list fallbacks in priority order; the qsaFirst() helper
- * tries them in order and returns the first hit.
- *
- * Strategy preference: stable attributes (role, name) first, then single CSS
- * classes, then aria-label/title/text matches LAST because those are
- * locale-dependent (a non-English Gmail UI changes them).
- */
 const SELECTORS = {
-  composeBody: ['div[aria-label="Message Body"]'],
-  composeRoot: ['div.nH', '[role="dialog"]'],
-  sendButton: [
-    '.T-I-atl',                                  // classic Gmail send-button class
-    '[role="button"][aria-label^="Send"]',        // aria-label (English UI)
-    '[aria-label^="Send"][role="button"]',
-    'div[role="button"][data-tooltip^="Send"]',
-  ],
-  sendButtonText: /^send$/i,                     // last resort: English button text
+  composeBody: ['div[role="textbox"][g_editable="true"]', 'div[aria-label="Message Body"]'],
+  sendButton: ['div.aoO', 'div.T-I-atl[role="button"]'],
   subjectInput: ['input[name="subjectbox"]'],
-  recipientChip: ['[email]'],
-  accountButton: ['[aria-label^="Google Account"]', '[aria-label*="@"]'],
-  sentRow: ['tr.zA'],
-  sentRowSubject: ['span.bog'],
-  sentRowDate: ['td.xW span'],
-  sentRowPeople: ['td.yX'],
-  messageViewHeader: ['div.ha'],
-  messageViewSubject: ['h2.hP'],
-  messageBodyImg: ['.a3s img[src]'],
-  dialog: ['[role="dialog"]'],
+  fieldsMarker: ['input[name="subjectbox"]', '[name="to"]', '.aoD', '.vR'],
+  recipientInputs: ['[name="to"]', '[name="cc"]', '[name="bcc"]'],
+  notComposeField: ['.a3s', '.adn', '.gs', '.hb', '.gD', 'h3', '[data-message-id]'],
+  threadSubject: ['h2.hP'],
+  listRow: ['tr.zA'],
+  listSubject: ['span.bog'],
+  listPeople: ['td.yX'],
+  listDate: ['td.xW span'],
+  messageHeader: ['div.ha'],
 };
-
-// First matching element for a selector list, or null. Never throws.
-function qsaFirst(root, selectors) {
-  try {
-    for (const sel of selectors) {
-      const el = root.querySelector(sel);
-      if (el) return el;
-    }
-  } catch (e) { /* never break Gmail */ }
-  return null;
-}
-
-function qsaAll(root, selectors) {
-  const out = [];
-  try {
-    for (const sel of selectors) {
-      root.querySelectorAll(sel).forEach((el) => { if (!out.includes(el)) out.push(el); });
-    }
-  } catch (e) { /* never break Gmail */ }
-  return out;
-}
-
-// Send-button lookup with fallback chain: class -> aria-label variants ->
-// English button-text match. Returns null when nothing matches (callers must
-// tolerate that: Sent-list fallback still catches the send).
-function findSendButton(root) {
-  const el = qsaFirst(root, SELECTORS.sendButton);
-  if (el) return el;
-  try {
-    const btns = root.querySelectorAll('[role="button"]');
-    for (const b of btns) {
-      if (SELECTORS.sendButtonText.test((b.textContent || '').trim())) return b;
-    }
-  } catch (e) { /* never break Gmail */ }
-  return null;
-}
-
+const COMPOSE_SELECTOR = SELECTORS.composeBody.join(', ');
+const SEND_BTN_SELECTOR = SELECTORS.sendButton.join(', ');
 const MARK_ATTR = 'data-pmt-tracked';
+const PX_RE = /\/px\/(trk_[A-Za-z0-9]{12})\.gif/;
+const EMAIL_RE = /[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/* ================= shared state ================= */
+
+let ownIds = new Set(); // track ids created by THIS browser profile (never cleared by the popup)
+let ownReady = false;
+
+function send(msg) {
+  try {
+    return chrome.runtime.sendMessage(msg).catch(() => null);
+  } catch (e) {
+    return Promise.resolve(null);
+  }
+}
+
+function loadLocalState() {
+  try {
+    chrome.storage.local.get(['ownIds'], (d) => {
+      if (chrome.runtime.lastError) return;
+      ownIds = new Set(d.ownIds || []);
+      ownReady = true;
+      sweepPixels();
+    });
+    chrome.storage.onChanged.addListener((ch, area) => {
+      if (area !== 'local') return;
+      if (ch.ownIds) { for (const id of ch.ownIds.newValue || []) ownIds.add(id); }
+      if (ch.tracks) scheduleTickRefresh();
+    });
+  } catch (e) { /* never break Gmail */ }
+}
 
 /* ================= Part 1: pixel insertion ================= */
 
+function countBoxes(el) {
+  return el.querySelectorAll(COMPOSE_SELECTOR).length;
+}
+
+// Lowest ancestor that contains this compose body AND a Send button but no other
+// compose body — i.e. exactly this compose window (popup, full-screen or inline reply).
 function getComposeRoot(box) {
-  try {
-    return qsaFirst(box, SELECTORS.composeRoot) || document;
-  } catch (e) {
-    return document;
+  let el = box.parentElement;
+  for (let i = 0; el && i < 25; i++, el = el.parentElement) {
+    if (countBoxes(el) > 1) break;
+    if (el.querySelector(SEND_BTN_SELECTOR)) return el;
   }
+  return box.closest('[role="dialog"]') || box.closest('form') || box.parentElement || document.body;
+}
+
+// The recipient / subject rows may sit above the Send toolbar — climb until we see them.
+function getFieldsRoot(box) {
+  let el = box.parentElement;
+  for (let i = 0; el && i < 30; i++, el = el.parentElement) {
+    if (countBoxes(el) > 1) break;
+    if (el.querySelector(SELECTORS.fieldsMarker.join(', '))) return el;
+  }
+  return getComposeRoot(box);
 }
 
 function getComposeSubject(box) {
   try {
-    // The compose window root usually carries the subject input nearby.
-    const root = getComposeRoot(box);
-    const input = qsaFirst(root, SELECTORS.subjectInput);
+    const input = getFieldsRoot(box).querySelector(SELECTORS.subjectInput.join(', '));
     if (input && input.value) return input.value.trim().slice(0, 300);
-  } catch (e) {
-    /* ignore */
-  }
+    const h = document.querySelector(SELECTORS.threadSubject.join(', ')); // inline reply: subject = thread subject
+    if (h && h.textContent) return h.textContent.trim().slice(0, 300);
+  } catch (e) { /* ignore */ }
   return '';
 }
 
-// Recipient chips in Gmail compose
+const NOT_COMPOSE_FIELD = SELECTORS.notComposeField.join(', ');
+
 function getComposeRecipients(box) {
   try {
-    const root = getComposeRoot(box);
-    const emails = [];
-    const sender = getSenderEmail().trim().toLowerCase();
-    // জিমেইলের নতুন ও পুরোনো সব ডিজাইনের জন্য
-    qsaAll(root, SELECTORS.recipientChip).forEach((c) => {
-      const em = (c.getAttribute('email') || '').trim();
-      // Gmail's compose subtree can include the active From account too.
-      // The tracker list is recipient-only, so never treat that as a recipient.
-      if (em && em.includes('@') && em.toLowerCase() !== sender && !emails.includes(em)) emails.push(em);
+    const root = getFieldsRoot(box);
+    const seen = [];
+    const add = (e) => {
+      e = (e || '').trim().toLowerCase();
+      if (e && !seen.includes(e)) seen.push(e);
+    };
+    root.querySelectorAll(SELECTORS.recipientInputs.join(', ')).forEach((el) => {
+      if (box.contains(el)) return;
+      const txt = el.value !== undefined && el.value !== '' ? el.value : el.textContent;
+      (String(txt || '').match(EMAIL_RE) || []).forEach(add);
     });
-    return emails.slice(0, 3).join(', ');
+    root.querySelectorAll('[email]').forEach((el) => {
+      if (box.contains(el) || el.closest(NOT_COMPOSE_FIELD)) return;
+      add(el.getAttribute('email'));
+    });
+    root.querySelectorAll('[data-hovercard-id*="@"]').forEach((el) => {
+      if (box.contains(el) || el.closest(NOT_COMPOSE_FIELD)) return;
+      add(el.getAttribute('data-hovercard-id'));
+    });
+    const me = (getSenderEmail() || '').toLowerCase();
+    const others = seen.filter((e) => e !== me);
+    return (others.length ? others : seen).slice(0, 5).join(', ');
   } catch (e) {
     return '';
   }
 }
 
-// Sender = the Gmail account logged into this Chrome profile.
+// Sender = the Gmail account of this tab (any UI language: the window title carries it).
 function getSenderEmail() {
   try {
-    // যেকোনো ভাষার জিমেইলের জন্য (ব্রাউজার টাইটেল থেকে ইমেইল ধরা)
-    const titleMatch = (document.title || '').match(/\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b/);
+    const titleMatch = (document.title || '').match(/\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/);
     if (titleMatch) return titleMatch[1];
-
-    const btn = qsaFirst(document, SELECTORS.accountButton);
+    const btn = document.querySelector('[aria-label^="Google Account"]') || document.querySelector('[aria-label*="@"]');
     if (btn) {
-      const m = (btn.getAttribute('aria-label') || '').match(/\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b/);
+      const m = (btn.getAttribute('aria-label') || '').match(/\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/);
       if (m) return m[1];
     }
-  } catch (e) {
-    /* ignore */
-  }
+  } catch (e) { /* ignore */ }
   return '';
 }
 
-// Tracks whose compose window is open but which haven't been sent yet.
-// A track leaves this set when the mail is actually sent (Send click,
-// Ctrl/Cmd+Enter, or the row appearing in Sent Mail). Pixel hits are ignored
-// server-side until then, so opening+closing compose never fakes an "open".
-const sentMarkedIds = new Set(); // locally committed ids (avoid double commit)
-
-// v1.7.0 (pure): client-generated track IDs — the pixel is injected instantly
-// at compose time without waiting for a server round-trip.
+// Client-generated id: the pixel goes in instantly, no server round-trip at compose.
 function newTrackId() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   const buf = new Uint8Array(12);
@@ -167,150 +156,179 @@ function newTrackId() {
   return s;
 }
 
-// Local-only metadata sync (debounced): keeps the freshest subject/recipients
-// on the LOCAL record, so even the schedule-send fallback (compose already
-// gone) commits real metadata instead of "(no subject)".
+// Keep the freshest metadata locally (Gmail strips To chips at Send time).
 function touchTrackMeta(box, trackId) {
   try {
     const subject = getComposeSubject(box);
-    const to = getComposeRecipients(box);
-    const from = getSenderEmail();
-    // v1.4: when Gmail strips To chips on Send click, the stored recipient is preserved.
-    const finalTo = to || box.dataset.pmtLastTo || '';
-    if (finalTo) box.dataset.pmtLastTo = finalTo;
-    if (subject) box.dataset.pmtLastSubj = subject;
-    chrome.runtime.sendMessage({ type: 'PMT_TOUCH_TRACK', trackId, subject, to: finalTo, from });
-  } catch (e) {
-    /* ignore */
-  }
-}
-
-// Send-time commit: the mail is really going out — the server track is
-// created NOW with the client-generated id and final metadata. The popup
-// therefore can never show a track for an unsent mail.
-function commitById(box, trackId) {
-  if (!trackId || sentMarkedIds.has(trackId)) return;
-  sentMarkedIds.add(trackId);
-  try {
-    const subject = getComposeSubject(box) || box.dataset.pmtLastSubj || '';
     const to = getComposeRecipients(box) || box.dataset.pmtLastTo || '';
-    const from = getSenderEmail();
-    chrome.runtime.sendMessage({ type: 'PMT_COMMIT_TRACK', trackId, subject, to, from }, () => {
-      if (chrome.runtime.lastError) showStaleBanner();
-    });
-  } catch (e) {
-    /* never break Gmail send */
-  }
-}
-
-// Fallback send detection: a Sent-list row matched an uncommitted local
-// track — the mail WAS sent (covers schedule-send and missed send clicks).
-function fallbackCommit(t) {
-  if (!t || !t.id || sentMarkedIds.has(t.id)) return;
-  sentMarkedIds.add(t.id);
-  try {
-    chrome.runtime.sendMessage(
-      { type: 'PMT_COMMIT_TRACK', trackId: t.id, subject: t.subject || '', to: t.recipient || '', from: t.sender || '' },
-      () => { if (chrome.runtime.lastError) showStaleBanner(); }
-    );
-  } catch (e) {
-    /* ignore */
-  }
-}
-
-function wireSendSync(box, trackId) {
-  try {
-    const root = getComposeRoot(box);
-    // Immediate send button (covers the normal Send click). Fallback chain in
-    // findSendButton(): class -> aria-label -> button text.
-    const sendBtn = findSendButton(root);
-    if (sendBtn && !sendBtn.dataset.pmtSyncWired) {
-      sendBtn.dataset.pmtSyncWired = '1';
-      sendBtn.addEventListener('click', () => commitById(box, trackId), true);
-    }
-    // Ctrl/Cmd+Enter keyboard send — no button click happens here.
-    if (!root.dataset.pmtKeyWired) {
-      root.dataset.pmtKeyWired = '1';
-      root.addEventListener('keydown', (e) => {
-        if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.keyCode === 13)) {
-          commitById(box, trackId);
-        }
-      }, true);
-    }
-    // Recipient/subject changes: keep LOCAL metadata fresh (the schedule-send
-    // fallback commits from the local record after the compose is gone).
-    if (!box.dataset.pmtInputWired) {
-      box.dataset.pmtInputWired = '1';
-      let timer = null;
-      root.addEventListener('input', () => {
-        clearTimeout(timer);
-        timer = setTimeout(() => touchTrackMeta(box, trackId), 2500);
-      }, true);
-    }
-  } catch (e) {
-    /* ignore */
-  }
+    if (to) box.dataset.pmtLastTo = to;
+    if (subject) box.dataset.pmtLastSubj = subject;
+    send({ type: 'PMT_TOUCH_TRACK', trackId, subject, to, from: getSenderEmail() });
+  } catch (e) { /* ignore */ }
 }
 
 function attachPixel(box) {
   if (box.hasAttribute(MARK_ATTR)) return;
+  if (/^#settings/.test(location.hash || '')) return; // signature editor etc. is not a mail
   box.setAttribute(MARK_ATTR, 'pending');
 
-  // v1.7.0: the track id is generated HERE, instantly — no server round-trip.
-  // The pixel goes in immediately; the server learns about the track at send
-  // time (commitById). A slow/napping server can never delay composing or
-  // eat the pixel anymore.
   const trackId = newTrackId();
-  const subject = getComposeSubject(box);
-  const to = getComposeRecipients(box);
-  const from = getSenderEmail();
-
-  // NOTE: this sendMessage MUST stay inside try/catch. If the extension is
-  // reloaded/updated while this Gmail tab is open, the old content script
-  // keeps running but its extension context is dead — the call throws
-  // "Extension context invalidated" synchronously (lastError never fires).
-  // We drop the pending mark so the re-injected script retries, and show the
-  // reconnecting banner. Gmail compose must never break because of this.
-  try {
-    chrome.runtime.sendMessage({ type: 'PMT_PREPARE_TRACK', id: trackId, subject, to, from }, (resp) => {
-      if (chrome.runtime.lastError || !resp || !resp.ok) {
-        box.removeAttribute(MARK_ATTR);
-        return;
+  ownIds.add(trackId); // known BEFORE the img exists, so the guard never mistakes it for foreign
+  send({
+    type: 'PMT_PREPARE_TRACK', id: trackId,
+    subject: getComposeSubject(box), to: getComposeRecipients(box), from: getSenderEmail(),
+  }).then((resp) => {
+    if (!resp || !resp.ok) {
+      // background asleep / server config missing: retry in a few seconds, never spin.
+      box.setAttribute(MARK_ATTR, 'failed');
+      setTimeout(() => box.removeAttribute(MARK_ATTR), 5000);
+      return;
+    }
+    try {
+      const base = resp.serverUrl.replace(/\/+$/, '');
+      const img = document.createElement('img');
+      img.setAttribute('src', base + '/px/' + trackId + '.gif');
+      img.setAttribute('width', '1');
+      img.setAttribute('height', '1');
+      img.setAttribute('border', '0');
+      img.setAttribute('alt', '');
+            box.setAttribute(MARK_ATTR, trackId); // set before the img lands so the guard recognises it
+      box.appendChild(img);
+      if (!box.dataset.pmtInputWired) {
+        box.dataset.pmtInputWired = '1';
+        let timer = null;
+        getFieldsRoot(box).addEventListener('input', () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => touchTrackMeta(box, trackId), 2500);
+        }, true);
       }
-      try {
-        const img = document.createElement('img');
-        img.setAttribute('src', resp.serverUrl.replace(/\/+$/, '') + '/px/' + trackId + '.gif');
-        img.setAttribute('width', '1');
-        img.setAttribute('height', '1');
-        img.setAttribute('border', '0');
-        img.setAttribute('alt', '');
-        // No display:none, no extra styling — a plain 1px image is the most
-        // filter-friendly form a tracking pixel can take.
-        box.appendChild(img);
-        box.setAttribute(MARK_ATTR, trackId);
-        wireSendSync(box, trackId);
-      } catch (e) {
-        box.removeAttribute(MARK_ATTR);
-      }
-    });
-  } catch (e) {
-    box.removeAttribute(MARK_ATTR);
-    showStaleBanner();
-  }
+    } catch (e) {
+      box.removeAttribute(MARK_ATTR);
+    }
+  });
 }
 
 function scan() {
-  qsaAll(document, SELECTORS.composeBody).forEach(attachPixel);
+  if (/^#settings/.test(location.hash || '')) return;
+  document.querySelectorAll(COMPOSE_SELECTOR).forEach(attachPixel);
 }
 
-/* ================= Part 2: tick marks ================= */
+/* ================= Part 2: send detection ================= */
 
-const TICK_ROW_ATTR = 'data-pmt-tick-row';
-const TICK_VIEW_ATTR = 'data-pmt-tick-view';
+function findTrackedBox(fromEl) {
+  let el = fromEl instanceof Element ? fromEl : null;
+  for (let i = 0; el && i < 30; i++, el = el.parentElement) {
+    const boxes = el.querySelectorAll('[' + MARK_ATTR + '^="trk_"]');
+    if (boxes.length === 1) return boxes[0];
+    if (boxes.length > 1) return null;
+  }
+  return null;
+}
+
+function commitFromBox(box) {
+  const trackId = box.getAttribute(MARK_ATTR);
+  if (!trackId || trackId.indexOf('trk_') !== 0) return;
+  const now = Date.now();
+  if (box._pmtLastCommit && now - box._pmtLastCommit < 2000) return;
+  box._pmtLastCommit = now;
+  try {
+    const subject = getComposeSubject(box) || box.dataset.pmtLastSubj || '';
+    const to = getComposeRecipients(box) || box.dataset.pmtLastTo || '';
+    send({ type: 'PMT_COMMIT_TRACK', trackId, subject, to, from: getSenderEmail() }).then((r) => {
+      if (!r) showStaleBanner();
+    });
+  } catch (e) { /* never break Gmail send */ }
+}
+
+// Fallback: a Sent-list row matched a track that was never committed (schedule-send,
+// missed click) -> the mail WAS sent.
+const fallbackDone = new Set();
+function fallbackCommit(t) {
+  if (!t || !t.id || fallbackDone.has(t.id)) return;
+  fallbackDone.add(t.id);
+  send({ type: 'PMT_COMMIT_TRACK', trackId: t.id, subject: t.subject || '', to: t.recipient || '', from: t.sender || '' });
+}
+
+document.addEventListener('click', (e) => {
+  try {
+    const btn = e.target instanceof Element ? e.target.closest(SEND_BTN_SELECTOR) : null;
+    if (!btn) return;
+    const box = findTrackedBox(btn);
+    if (box) commitFromBox(box);
+  } catch (err) { /* ignore */ }
+}, true);
+
+document.addEventListener('keydown', (e) => {
+  try {
+    if (!((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.keyCode === 13))) return;
+    const box = findTrackedBox(e.target);
+    if (box) commitFromBox(box);
+  } catch (err) { /* ignore */ }
+}, true);
+
+/* ================= Part 3: own-open guard ================= */
+
+function pixelIdFromSrc(src) {
+  if (!src || src.indexOf('trk_') === -1) return null; // fast reject (Gmail has thousands of imgs)
+  let s = src;
+  try { s = decodeURIComponent(src); } catch (e) { /* keep raw */ }
+  const m = s.match(PX_RE);
+  return m ? m[1] : null;
+}
+
+const selfViewSentAt = {};
+function signalSelfView(id) {
+  const now = Date.now();
+  if (selfViewSentAt[id] && now - selfViewSentAt[id] < 8000) return; // each new view re-signals
+  selfViewSentAt[id] = now;
+  send({ type: 'PMT_SELF_VIEW', trackId: id });
+}
+
+// Called for every <img> Gmail adds / re-points. Own pixel outside the compose window =
+// the sender (or a quoted copy of the sender's mail) is looking at it -> tell the
+// server first, then take the pixel out of the page. Foreign pixels (other people's
+// trackers sharing this server) are never touched.
+function guardPixel(img) {
+  if (!img || img.tagName !== 'IMG') return;
+  const id = pixelIdFromSrc(img.getAttribute('src'));
+  if (!id) return;
+  if (ownReady && !ownIds.has(id)) return;
+
+  const box = img.closest(COMPOSE_SELECTOR);
+  if (box) {
+    // Inside a compose window the ONE pixel we added stays. Any other of our pixels
+    // (quoted earlier mail in a reply/forward, resumed draft) would ping the old
+    // track from the sender's own browser -> remove it from the outgoing copy.
+    if (box.getAttribute(MARK_ATTR) === id) return;
+    img.remove();
+    return;
+  }
+  signalSelfView(id);
+  img.remove();
+}
+
+function sweepPixels() {
+  try { document.querySelectorAll('img[src*="trk_"]').forEach(guardPixel); } catch (e) { /* ignore */ }
+}
+
+const guardObserver = new MutationObserver((muts) => {
+  for (const m of muts) {
+    if (m.type === 'attributes') {
+      guardPixel(m.target);
+    } else {
+      for (const n of m.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.tagName === 'IMG') guardPixel(n);
+        else if (n.querySelectorAll) n.querySelectorAll('img[src*="trk_"]').forEach(guardPixel);
+      }
+    }
+  }
+});
+guardObserver.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+
+/* ================= Part 4: tick marks ================= */
 
 function normSubject(s) {
-  // v1.6.1: strip Re:/Fw:/Fwd: prefixes (possibly nested) so a reply's
-  // "Re: College program" matches the Sent-list thread row "College program".
   let n = (s || '').trim().replace(/\s+/g, ' ').toLowerCase();
   let prev;
   do {
@@ -320,9 +338,7 @@ function normSubject(s) {
   return n;
 }
 
-// v1.6.1: thread rows show the thread subject ("College program - yes On
-// Thu,") while the track holds the message subject ("College program").
-// A prefix match (short >= 4 chars) counts, on top of exact equality.
+// Thread rows show the thread subject + snippet; accept a prefix match (>= 4 chars).
 function subjectsMatch(a, b) {
   if (!a || !b) return false;
   if (a === b) return true;
@@ -332,21 +348,13 @@ function subjectsMatch(a, b) {
 }
 
 function fmtTickTime(iso) {
-  try {
-    return new Date(iso).toLocaleString();
-  } catch (e) {
-    return iso || '';
-  }
+  try { return new Date(iso).toLocaleString(); } catch (e) { return iso || ''; }
 }
 
-// Parse the date text Gmail shows in the Sent list ("4:53 PM", "Sep 29", ...)
-// into a Date. Best effort — returns null when it cannot tell.
 function parseGmailDate(txt) {
   txt = (txt || '').trim();
   if (!txt) return null;
   const now = new Date();
-
-  // "4:53 PM" or "16:53" -> today at that time
   let m = txt.match(/^(\d{1,2}):(\d{2})\s*([AP])\.?\s*M\.?$/i) || txt.match(/^(\d{1,2}):(\d{2})$/);
   if (m) {
     let h = parseInt(m[1], 10);
@@ -362,8 +370,6 @@ function parseGmailDate(txt) {
     if (d.getTime() > now.getTime() + 5 * 60 * 1000) d.setDate(d.getDate() - 1);
     return d;
   }
-
-  // "Sep 29" -> that date this year (last year if it would be in the future)
   m = txt.match(/^([A-Za-z]{3,9})\s+(\d{1,2})$/);
   if (m) {
     const d = new Date(m[1] + ' ' + m[2] + ', ' + now.getFullYear());
@@ -371,23 +377,42 @@ function parseGmailDate(txt) {
     if (d.getTime() > now.getTime()) d.setFullYear(d.getFullYear() - 1);
     return d;
   }
-
-  // "2026/09/29" or "2026-09-29"
   m = txt.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
   if (m) return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
-
   return null;
 }
 
-// Match a Gmail row/view subject to one of our tracks.
-// Same-subject duplicates are disambiguated by the row date (12h window);
-// without a usable date hint the most recent track wins.
-function findTrack(tracks, subject, dateHint) {
+// Gmail's date cell carries the full timestamp in its title attribute — more reliable than the text.
+function rowDate(row) {
+  const el = row.querySelector(SELECTORS.listDate.join(', '));
+  if (!el) return null;
+  const t = el.getAttribute('title');
+  if (t) {
+    const d = new Date(t);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return parseGmailDate(el.textContent);
+}
+
+function emailsOf(str) {
+  return (String(str || '').toLowerCase().match(EMAIL_RE) || []);
+}
+
+// Match a Gmail row/view to one of our tracks: subject first, then recipients,
+// then the row's date (12h window); committed tracks beat never-sent composes.
+function findTrack(tracks, subject, dateHint, rowEmails) {
   const ns = normSubject(subject);
   if (!ns || !Array.isArray(tracks)) return null;
-  const cands = tracks.filter((t) => subjectsMatch(normSubject(t.subject), ns));
+  let cands = tracks.filter((t) => subjectsMatch(normSubject(t.subject), ns));
   if (cands.length === 0) return null;
+  const committed = cands.filter((t) => t.sent !== 0);
+  if (committed.length) cands = committed;
   if (cands.length === 1) return cands[0];
+  if (rowEmails && rowEmails.length) {
+    const byRcpt = cands.filter((t) => emailsOf(t.recipient).some((e) => rowEmails.includes(e)));
+    if (byRcpt.length) cands = byRcpt;
+    if (cands.length === 1) return cands[0];
+  }
   if (!dateHint || isNaN(dateHint.getTime())) {
     return cands.slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))[cands.length - 1];
   }
@@ -397,125 +422,105 @@ function findTrack(tracks, subject, dateHint) {
     const c = new Date(t.createdAt).getTime();
     if (isNaN(c)) continue;
     const diff = Math.abs(c - dateHint.getTime());
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = t;
-    }
+    if (diff < bestDiff) { bestDiff = diff; best = t; }
   }
   return best && bestDiff < 12 * 3600 * 1000 ? best : null;
 }
 
 function tickTitle(t) {
-  const raw = t.rawCount || 0;
-  const n = t.uniqueCount || 0;
-  if (raw > 0) {
-    let s = 'Detected — ' + n + ' estimated unique detection' + (n === 1 ? '' : 's') +
-      ' (' + raw + ' tracking event' + (raw === 1 ? '' : 's') + ')';
-    if (t.lastDetectedAt) s += ' · last detected ' + fmtTickTime(t.lastDetectedAt);
-    if (t.viaGmail) s += ' (via Gmail)';
-    s += '. Tracking detects image loading; it cannot prove the message was read.';
-    return s;
+  if (t.rawCount > 0) {
+    let s = 'Detected — ' + t.rawCount + ' tracking event' + (t.rawCount === 1 ? '' : 's');
+    if (t.uniqueCount && t.uniqueCount !== t.rawCount) s += ' (' + t.uniqueCount + ' estimated unique)';
+    if (t.lastDetectedAt) s += ' · last ' + fmtTickTime(t.lastDetectedAt);
+    if (t.viaGmail) s += ' · via Gmail';
+    return s + '\nImage loads are not proof the message was read.';
   }
   return 'Sent — no detection yet';
 }
 
+function tickSig(t) {
+  return [t.id, t.rawCount > 0 ? 2 : 1, t.rawCount, t.uniqueCount || 0, t.lastDetectedAt || ''].join('|');
+}
+
 function makeTickEl(t) {
-  const detected = (t.rawCount || 0) > 0;
+  const seen = t.rawCount > 0;
   const el = document.createElement('span');
   el.setAttribute('data-pmt-tick', t.id);
-  el.textContent = detected ? '✓✓' : '✓';
+  el.setAttribute('data-pmt-sig', tickSig(t));
+  el.textContent = seen ? '✓✓' : '✓';
   el.title = tickTitle(t);
   el.style.cssText =
-    'display:inline-block;margin:0 6px 0 2px;font-size:13px;font-weight:700;' +
-    'line-height:1;vertical-align:baseline;cursor:default;' +
-    (detected ? 'color:#00b578;' : 'color:#9aa0a6;');
+    'display:inline-block;margin:0 6px 0 2px;font-size:13px;font-weight:700;line-height:1;' +
+    'vertical-align:baseline;cursor:default;' + (seen ? 'color:#00b578;' : 'color:#9aa0a6;');
   return el;
 }
 
+// #sent, #sent?page=2, #sent/p2  = list;  #sent/<message id>  = message view
 function isSentListView() {
-  const h = location.hash || '';
-  return h === '#sent' || h.indexOf('#sent?') === 0;
+  return /^#sent(\/p\d+)?(\?.*)?$/.test(location.hash || '');
 }
-
 function isSentEmailView() {
-  return /^#sent\//.test(location.hash || '');
+  return /^#sent\/(?!p\d+(\?.*)?$)/.test(location.hash || '');
 }
 
-// Ticks next to each tracked email in the Sent Mail list.
-// v1.7.0: destroy + re-render every pass (Mailsuite technique) — stale or
-// duplicated ticks are impossible by construction.
+// Idempotent: a row whose tick already shows the right state is left alone, so
+// rendering never causes DOM churn (and can never feed back into the observer).
+function placeTick(container, anchorFirst, t) {
+  const existing = container.querySelector(':scope > [data-pmt-tick]');
+  if (existing && existing.getAttribute('data-pmt-sig') === tickSig(t)) return;
+  if (existing) existing.remove();
+  const el = makeTickEl(t);
+  if (anchorFirst) container.insertBefore(el, container.firstChild);
+  else container.appendChild(el);
+}
+
 function refreshSentList(tracks) {
-  try {
-    document.querySelectorAll('[data-pmt-tick]').forEach((el) => el.remove());
-    document.querySelectorAll('tr.zA').forEach((row) => row.removeAttribute(TICK_ROW_ATTR));
-  } catch (e) { /* never break Gmail */ }
-  const rows = qsaAll(document, SELECTORS.sentRow);
-  rows.forEach((row) => {
+  document.querySelectorAll(SELECTORS.listRow.join(', ')).forEach((row) => {
     try {
-      const subjEl = qsaFirst(row, SELECTORS.sentRowSubject);
-      if (!subjEl || !subjEl.parentElement) return;
-      const dateEl = qsaFirst(row, SELECTORS.sentRowDate);
-      const t = findTrack(tracks, subjEl.textContent, dateEl ? parseGmailDate(dateEl.textContent) : null);
-      if (!t) return;
-      // Fallback send detection: the row is in Sent Mail, so this mail was
-      // really sent (covers schedule-send and any missed send clicks).
+      const subjEl = row.querySelector(SELECTORS.listSubject.join(', '));
+      const peopleCell = row.querySelector(SELECTORS.listPeople.join(', '));
+      const holder = peopleCell || (subjEl && subjEl.parentElement);
+      if (!subjEl || !holder) return;
+      const rowEmails = Array.from(row.querySelectorAll('[email]')).map((e) => (e.getAttribute('email') || '').toLowerCase());
+      const t = findTrack(tracks, subjEl.textContent, rowDate(row), rowEmails);
+      if (!t) {
+        holder.querySelectorAll(':scope > [data-pmt-tick]').forEach((x) => x.remove());
+        return;
+      }
       if (t.sent === 0) fallbackCommit(t);
-      // Mailsuite-style placement (v1.6): tick sits LEFT, right before
-      // "To:" inside td.yX (between the star and the recipient).
-      const peopleCell = qsaFirst(row, SELECTORS.sentRowPeople);
-      if (peopleCell) peopleCell.insertBefore(makeTickEl(t), peopleCell.firstChild);
-      else subjEl.parentElement.appendChild(makeTickEl(t)); // fallback
-      row.setAttribute(TICK_ROW_ATTR, t.id);
-    } catch (e) {
-      /* never break Gmail */
-    }
+      placeTick(holder, !!peopleCell, t);
+    } catch (e) { /* never break Gmail */ }
   });
 }
 
-// Tick in the header when reading a sent email.
 function refreshSentEmailView(tracks) {
-  const header = qsaFirst(document, SELECTORS.messageViewHeader);
-  if (!header) return;
   try {
-    header.querySelectorAll('[data-pmt-tick]').forEach((el) => el.remove());
-    header.removeAttribute(TICK_VIEW_ATTR);
-    const h2 = qsaFirst(header, SELECTORS.messageViewSubject);
+    const header = document.querySelector(SELECTORS.messageHeader.join(', '));
+    const h2 = header && header.querySelector(SELECTORS.threadSubject.join(', '));
     if (!h2 || !h2.parentElement) return;
-    const t = findTrack(tracks, h2.textContent, null);
-    if (!t) return;
-    h2.parentElement.appendChild(makeTickEl(t));
-    header.setAttribute(TICK_VIEW_ATTR, t.id);
-  } catch (e) {
-    /* never break Gmail */
-  }
+    const t = findTrack(tracks, h2.textContent, null, null);
+    if (!t) {
+      h2.parentElement.querySelectorAll(':scope > [data-pmt-tick]').forEach((x) => x.remove());
+      return;
+    }
+    placeTick(h2.parentElement, false, t);
+  } catch (e) { /* never break Gmail */ }
 }
 
 async function refreshTicks() {
-  let resp = null;
-  try {
-    resp = await chrome.runtime.sendMessage({ type: 'PMT_GET_TICK_DATA' });
-  } catch (e) {
-    // Brief disconnect (e.g. extension updating right now) — the banner
-    // explains, and auto re-inject heals the tab without any F5.
+  if (!isSentListView() && !isSentEmailView()) return;
+  const resp = await send({ type: 'PMT_GET_TICK_DATA' });
+  if (!resp || !resp.ok || !Array.isArray(resp.tracks)) {
     showStaleBanner();
     return;
   }
-  if (!resp || !resp.ok || !Array.isArray(resp.tracks)) return;
-  try {
-    // Connection healthy again — remove any stale banner.
-    const stale = document.querySelector('[data-pmt-stale]');
-    if (stale) stale.remove();
-    if (isSentListView()) refreshSentList(resp.tracks);
-    else if (isSentEmailView()) refreshSentEmailView(resp.tracks);
-  } catch (e) {
-    /* never break Gmail */
-  }
+  const stale = document.querySelector('[data-pmt-stale]');
+  if (stale) stale.remove();
+  staleBannerShown = false;
+  if (isSentListView()) refreshSentList(resp.tracks);
+  else refreshSentEmailView(resp.tracks);
 }
 
-// v1.7.0 — one-time banner when this tab's content script briefly loses its
-// connection (e.g. right after an extension update, before auto re-inject
-// heals it). Auto-removed on the next successful refresh. Pure DOM, never
-// touches email content.
 let staleBannerShown = false;
 function showStaleBanner() {
   if (staleBannerShown) return;
@@ -524,10 +529,9 @@ function showStaleBanner() {
     const bar = document.createElement('div');
     bar.setAttribute('data-pmt-stale', '1');
     bar.style.cssText =
-      'position:fixed;top:10px;right:10px;z-index:999999;background:#fff8e1;color:#5d4037;' +
-      'border:1px solid #e6a500;border-radius:8px;padding:8px 12px;font-size:13px;' +
-      'font-family:Roboto,Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25);';
-    bar.textContent = 'ProMail Tracker: reconnecting… (auto-recovers, no action needed) ';
+      'position:fixed;top:10px;right:10px;z-index:999999;background:#fff8e1;color:#5d4037;border:1px solid #e6a500;' +
+      'border-radius:8px;padding:8px 12px;font-size:13px;font-family:Roboto,Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25);';
+    bar.textContent = 'ProMail Tracker: reconnecting… (auto-recovers) ';
     const x = document.createElement('button');
     x.textContent = '✕';
     x.setAttribute('aria-label', 'Dismiss');
@@ -535,9 +539,7 @@ function showStaleBanner() {
     x.onclick = () => bar.remove();
     bar.appendChild(x);
     document.documentElement.appendChild(bar);
-  } catch (e) {
-    /* never break Gmail */
-  }
+  } catch (e) { /* ignore */ }
 }
 
 let tickTimer = null;
@@ -549,106 +551,34 @@ function scheduleTickRefresh() {
   }, 1200);
 }
 
-/* ================= Part 3: self-view detection (v1.4) =================
- *
- * The sender opening their own sent mail must NOT count as an "open" —
- * only the receiver's opens count. Gmail renders message bodies with class
- * "a3s". We signal the server when one of our tracking pixels actually
- * LOADS inside a message view (img load event, or img.complete for pixels
- * that finished before we saw them). Signalling on load — not on DOM
- * insert — keeps the signal tightly correlated with the pixel hit the
- * server logs (~1s apart), and also covers lazy-loaded images (long mails:
- * the pixel loads only when the sender scrolls to the bottom) and Gmail's
- * "ask before displaying images" setting (no load -> no hit -> nothing to
- * suppress). The server then ignores pixel hits inside the suppression
- * window (no count, no notification).
- *
- * The pixel src may be direct (our server URL) or Gmail-proxied
- * (googleusercontent.com/proxy/<hash>#<original-url>) — the regex matches
- * the /px/<id>.gif part in either form. Compose windows are excluded
- * (they are dialogs / lack .a3s), so typing an email never signals.
- */
-
-function extractPixelTrackId(src) {
-  try {
-    // জিমেইল ইউআরএল এনকোড করে দিলে সেটা ঠিক করার জন্য decodeURIComponent যোগ করা হলো
-    const decodedSrc = decodeURIComponent(src || '');
-    const m = String(decodedSrc).match(/\/px\/(trk_[A-Za-z0-9]+)\.gif/i);
-    return m ? m[1] : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-// trackId -> timestamp of last signal (debounce: one signal per 60s per mail)
-const selfViewSentAt = {};
-// pixel imgs already wired with a load listener (WeakSet: no leaks)
-const selfViewWired = new WeakSet();
-
-function signalSelfView(id) {
-  const now = Date.now();
-  if (selfViewSentAt[id] && now - selfViewSentAt[id] < 60000) return;
-  selfViewSentAt[id] = now;
-  try {
-    chrome.runtime.sendMessage({ type: 'PMT_SELF_VIEW', trackId: id });
-  } catch (e) {
-    /* never break Gmail */
-  }
-}
-
-function scanSelfViews() {
-  let imgs;
-  try {
-    imgs = qsaAll(document, SELECTORS.messageBodyImg);
-  } catch (e) {
-    return;
-  }
-  imgs.forEach((img) => {
-    try {
-      if (img.closest(SELECTORS.dialog[0])) return; // compose, not a message view
-      const id = extractPixelTrackId(img.getAttribute('src'));
-      if (!id) return;
-      if (img.complete) {
-        signalSelfView(id); // already loaded (possibly from cache)
-      } else if (!selfViewWired.has(img)) {
-        selfViewWired.add(img);
-        img.addEventListener('load', () => signalSelfView(id), { once: true });
-      }
-    } catch (e) {
-      /* never break Gmail */
-    }
-  });
-}
-
-let selfViewLastScan = 0;
-function scheduleSelfViewScan() {
-  const now = Date.now();
-  if (now - selfViewLastScan < 2000) return; // throttle: DOM mutates constantly
-  selfViewLastScan = now;
-  try {
-    scanSelfViews();
-  } catch (e) {
-    /* never break Gmail */
-  }
-}
-
 /* ================= wiring ================= */
 
-const observer = new MutationObserver(() => {
+function isOurNode(n) {
+  if (!n) return false;
+  const el = n.nodeType === 1 ? n : n.parentElement;
+  return !!(el && el.closest && el.closest('[data-pmt-tick], [data-pmt-stale]'));
+}
+
+// Ignore the DOM changes WE make (ticks / banner) — otherwise rendering retriggers rendering.
+const observer = new MutationObserver((muts) => {
+  let external = false;
+  for (const m of muts) {
+    const changed = [...m.addedNodes, ...m.removedNodes];
+    if (changed.length && changed.every(isOurNode)) continue;
+    external = true;
+    break;
+  }
+  if (!external) return;
   scan();
   scheduleTickRefresh();
-  scheduleSelfViewScan();
 });
 observer.observe(document.body, { childList: true, subtree: true });
-scan();
 
-window.addEventListener('hashchange', () => {
-  setTimeout(refreshTicks, 600);
-  setTimeout(scheduleSelfViewScan, 800);
-});
+loadLocalState();
+scan();
+window.addEventListener('hashchange', () => setTimeout(refreshTicks, 600));
 setInterval(refreshTicks, 30000);
 setTimeout(refreshTicks, 2500);
-setTimeout(scheduleSelfViewScan, 3000);
-
+setTimeout(sweepPixels, 1500);
 
 } // __pmtBooted
