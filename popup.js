@@ -70,21 +70,25 @@ function shouldShowTrack(t) {
 
 function detectionLine(t) {
   const a = analyticsOf(t);
-  if (!a.raw) return 'Sent — no detection yet';
-  const bits = [`${a.raw} tracking event${a.raw === 1 ? '' : 's'}`];
-  if (a.unique !== a.raw) bits.push(`${a.unique} estimated unique`);
+  if (!a.raw) return 'Sent — not opened yet';
+  // Headline = how many times the mail was opened (estimated unique opens:
+  // duplicate proxy/cache hits are deduped server-side). Raw event count is
+  // shown too when it differs, and the header ⓘ keeps the honest definition.
+  const opens = a.unique || a.raw;
+  const bits = [`Opened ${opens} time${opens === 1 ? '' : 's'}`];
+  if (a.raw !== opens) bits.push(`${a.raw} tracking events`);
   const evs = (t.recentEvents || []).filter((e) => !e.is_suspected_self_view);
   const last = evs.length ? evs[evs.length - 1] : null;
   if (last && last.event_type === 'GMAIL_PROXY') bits.push('via Gmail');
   else if (last && last.event_type === 'DIRECT') bits.push('direct');
-  return 'Detected · ' + bits.join(' · ');
+  return bits.join(' · ');
 }
 
 function timeLine(t) {
   const a = analyticsOf(t);
   if (!a.first) return '';
-  if (a.first === a.last) return `Detected ${esc(fmt(a.first))}`;
-  return `First ${esc(fmt(a.first))} · Last ${esc(fmt(a.last))}`;
+  if (a.first === a.last) return `Opened ${esc(fmt(a.first))}`;
+  return `First opened ${esc(fmt(a.first))} · Last opened ${esc(fmt(a.last))}`;
 }
 
 // Expandable per-event detection history (cached recent events).
